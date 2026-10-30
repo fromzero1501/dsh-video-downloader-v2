@@ -1,7 +1,7 @@
 {
   "name": "dsh-video-downloader",
-  "version": "0.4.0",
-  "description": "Media downloader for DeepSeek Harness 0.2.x. Classify links, resolve Bilibili page URLs into real streams, fetch Douyin playback streams through a local headless browser (no cookies), and download video/audio to disk with ffmpeg muxing.",
+  "version": "0.4.1",
+  "description": "DSH video downloader: Bilibili built-in, Douyin via local headless browser (warm, no cookie), yt-dlp for other sites",
   "type": "module",
   "main": "src/index.js",
   "exports": {

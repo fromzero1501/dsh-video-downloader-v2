@@ -19,7 +19,7 @@
  * Schema, which is exactly what `ctx.tools.register()` consumes.
  */
 
-import { createWriteStream, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { createWriteStream, mkdirSync, mkdtempSync, statSync } from 'node:fs'
 import { existsSync } from 'node:fs'
 import { renameSync, unlinkSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -1028,6 +1028,9 @@ const DOUYIN_DIM_EXPR = [
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 
+/** 小于这个体积基本是抖音的试看片段，不是完整作品。 */
+const PREVIEW_BYTES = 800_000
+
 let browserProbe = null
 
 /** Locate the browser used for the Douyin path; '' when none is installed. */
@@ -1141,7 +1144,107 @@ async function evalIn(call, expression) {
 }
 
 /**
- * Open a Douyin video page in a throwaway headless browser and read the playing
+ * 常驻的无头浏览器：抖音这条路上「起进程 + 冷缓存」占了大头，留着复用能省掉
+ * 每次 1 秒上下的启动与重新拉取页面资源。空闲 3 分钟自动退出，profile 留在 tmp 里当缓存。
+ */
+let warmBrowser = null
+const WARM_IDLE_MS = 180_000
+let exitHookBound = false
+
+function warmBrowserAlive() {
+  return !!(warmBrowser && warmBrowser.child && warmBrowser.child.exitCode === null)
+}
+
+function shutdownWarmBrowser() {
+  if (!warmBrowser) return
+  const current = warmBrowser
+  warmBrowser = null
+  if (current.idleTimer) clearTimeout(current.idleTimer)
+  try {
+    current.child.kill()
+  } catch {
+    // already exited
+  }
+}
+
+function bindExitHook() {
+  if (exitHookBound) return
+  exitHookBound = true
+  const bye = () => shutdownWarmBrowser()
+  process.once('exit', bye)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    try {
+      process.once(sig, () => {
+        bye()
+        process.exit(130)
+      })
+    } catch {
+      // 不支持的信号就跳过
+    }
+  }
+}
+
+function launchBrowser(bin, profileDir) {
+  return freePort().then(async (port) => {
+    const child = spawn(
+      bin,
+      [
+        '--headless=new',
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profileDir}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-gpu',
+        '--mute-audio',
+        '--disable-blink-features=AutomationControlled',
+        'about:blank',
+      ],
+      { stdio: 'ignore', windowsHide: true },
+    )
+    const { webSocketDebuggerUrl } = await waitForDevtools(port, Date.now() + 15_000)
+    // 常驻进程不能拖住宿主的事件循环，出问题由 exit 钩子负责收尸
+    if (typeof child.unref === 'function') child.unref()
+    return { child, port, profileDir, wsUrl: webSocketDebuggerUrl, idleTimer: null }
+  })
+}
+
+async function acquireBrowser(bin) {
+  if (warmBrowserAlive()) {
+    if (warmBrowser.idleTimer) clearTimeout(warmBrowser.idleTimer)
+    warmBrowser.idleTimer = null
+    return warmBrowser
+  }
+  shutdownWarmBrowser()
+  bindExitHook()
+  const shared = join(tmpdir(), 'dsh-douyin-profile')
+  mkdirSync(shared, { recursive: true })
+  try {
+    warmBrowser = await launchBrowser(bin, shared)
+  } catch {
+    // 共享 profile 可能被上次异常退出的实例占着，退回一次性 profile
+    shutdownWarmBrowser()
+    warmBrowser = await launchBrowser(bin, mkdtempSync(join(tmpdir(), 'dsh-douyin-')))
+  }
+  const session = warmBrowser
+  session.child.once('exit', () => {
+    if (warmBrowser === session) warmBrowser = null
+  })
+  return warmBrowser
+}
+
+function releaseBrowser(idleMs = WARM_IDLE_MS) {
+  if (!warmBrowserAlive()) {
+    shutdownWarmBrowser()
+    return
+  }
+  if (warmBrowser.idleTimer) clearTimeout(warmBrowser.idleTimer)
+  const timer = setTimeout(() => shutdownWarmBrowser(), idleMs)
+  if (typeof timer.unref === 'function') timer.unref()
+  warmBrowser.idleTimer = timer
+}
+
+/**
+ * Open a Douyin video page in the warm headless browser and read the playing
  * source off the player. Returns the signed media URL; nothing is written to the
  * plugin's own storage.
  */
@@ -1155,33 +1258,26 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
   }
   if (signal?.aborted) throw new Error('执行已取消')
 
-  const port = await freePort()
-  const profileDir = mkdtempSync(join(tmpdir(), 'dsh-douyin-'))
-  const child = spawn(
-    bin,
-    [
-      '--headless=new',
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profileDir}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-gpu',
-      '--mute-audio',
-      '--disable-blink-features=AutomationControlled',
-      'about:blank',
-    ],
-    { stdio: 'ignore', windowsHide: true },
-  )
-
+  const session = await acquireBrowser(bin)
+  const cdp = await openCdp(session.wsUrl)
+  let targetId = ''
   try {
-    const { webSocketDebuggerUrl } = await waitForDevtools(port, Date.now() + 20_000)
-    const cdp = await openCdp(webSocketDebuggerUrl)
-    try {
-      const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' })
+    {
+      const created = await cdp.send('Target.createTarget', { url: 'about:blank' })
+      targetId = created.targetId
       const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
       const call = (method, params) => cdp.send(method, params, sessionId)
       await call('Page.enable', {})
       await call('Runtime.enable', {})
+      // 图片和字体对取流没用，挡掉能让页面早几百毫秒出播放器
+      try {
+        await call('Network.enable', {})
+        await call('Network.setBlockedURLs', {
+          urls: ['*.png', '*.jpg', '*.jpeg', '*.webp', '*.gif', '*.svg', '*.ico', '*.woff', '*.woff2', '*.ttf'],
+        })
+      } catch {
+        // 老版本内核不支持就算了
+      }
       await call('Page.navigate', { url: pageUrl })
 
       let mediaUrl = ''
@@ -1191,14 +1287,17 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
       let duration = 0
       let contentBytes = 0
       let candidates = []
-      const deadline = Date.now() + timeoutMs
+      const sizes = new Map()
+      const startedAt = Date.now()
+      const deadline = startedAt + timeoutMs
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error('执行已取消')
         const probe = await evalIn(call, DOUYIN_SRC_EXPR)
         if (probe && typeof probe === 'object') {
           title = String(probe.title || '') || title
-          width = Number(probe.width) || width
-          height = Number(probe.height) || height
+          // 播放器会先给一个较小的占位尺寸再换到真实码流，取整段轮询里的最大值
+          if (Number(probe.width) > width) width = Number(probe.width)
+          if (Number(probe.height) > height) height = Number(probe.height)
           duration = Number(probe.duration) || duration
           candidates = Array.isArray(probe.candidates)
             ? probe.candidates.filter((u) => /^https?:\/\//i.test(u))
@@ -1206,36 +1305,37 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
         } else if (typeof probe === 'string' && /^https?:\/\//i.test(probe)) {
           candidates = [probe]
         }
-        if (candidates.length) break
-        await delay(500)
+        if (candidates.length) {
+          const shortlist = candidates.slice(0, 4)
+          await Promise.all(
+            shortlist.map(async (u) => {
+              if (!sizes.has(u)) sizes.set(u, await probeContentSize(u, { signal }))
+            }),
+          )
+          for (const u of shortlist) {
+            const size = sizes.get(u) || 0
+            if (!mediaUrl || size > contentBytes) {
+              mediaUrl = u
+              contentBytes = size
+            }
+          }
+          // 页面偶尔先给一条几秒钟的试看流：标题都还没出来、体积又很小时先别急
+          const settled = (title && (!contentBytes || contentBytes >= PREVIEW_BYTES)) || candidates.length > 1
+          if (settled) break
+          if (Date.now() - startedAt > 10_000) break
+        }
+        await delay(150)
       }
-      if (!candidates.length) {
+      if (!mediaUrl) {
         const err = new Error('播放页在时限内没有给出可下载地址（可能需要登录，或这个作品已失效）')
         err.code = 'no_stream'
         throw err
       }
-      // 页面偶尔先给出的是几秒钟的试看流：按体积挑最大的那条
-      mediaUrl = candidates[0]
-      if (candidates.length > 1) {
-        const sized = []
-        for (const u of candidates.slice(0, 4)) sized.push({ u, size: await probeContentSize(u, { signal }) })
-        sized.sort((a, b) => b.size - a.size)
-        mediaUrl = sized[0].size ? sized[0].u : candidates[0]
-        contentBytes = sized[0].size || 0
-      }
-      // 直链先出现、<video> 的元数据后到，补齐真实分辨率（用于 quality 标签）
+      // 分辨率只用来打 quality 标签，不再为它多等：读到就写，读不到就按 URL 推
       if (!height) {
-        const dimDeadline = Date.now() + 4000
-        while (Date.now() < dimDeadline) {
-          const dim = await evalIn(call, DOUYIN_DIM_EXPR)
-          const h = Number(dim?.height) || 0
-          if (h) {
-            height = h
-            width = Number(dim?.width) || 0
-            break
-          }
-          await delay(300)
-        }
+        const dim = await evalIn(call, DOUYIN_DIM_EXPR)
+        height = Number(dim?.height) || 0
+        width = Number(dim?.width) || width
       }
       return {
         backend: 'douyin-browser',
@@ -1249,28 +1349,43 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
         candidates: candidates.length,
         quality: width && height ? `${Math.min(width, height)}P` : getQuality(mediaUrl),
       }
-    } finally {
-      cdp.close()
     }
   } finally {
-    try {
-      child.kill()
-    } catch {
-      // already exited
-    }
-    await delay(300)
-    for (let i = 0; i < 6; i++) {
+    if (targetId) {
       try {
-        rmSync(profileDir, { recursive: true, force: true })
-        break
+        await Promise.race([
+          cdp.send('Target.closeTarget', { targetId }),
+          delay(1500).then(() => {
+            throw new Error('closeTarget timeout')
+          }),
+        ])
       } catch {
-        await delay(300)
+        // 关不掉不影响结果，下次复用新的 target
       }
     }
+    cdp.close()
+    releaseBrowser()
   }
 }
 
 /** Resolve a Douyin page through the browser and save the file it points at. */
+/** 用本机 ffmpeg 读落盘文件的真实宽高；拿不到就返回 null。 */
+function probeVideoDims(filePath) {
+  const ffmpeg = findFfmpeg()
+  if (!ffmpeg) return null
+  let text = ''
+  try {
+    text = String(execFileSync(ffmpeg, ['-hide_banner', '-i', filePath], { encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe'], timeout: 8000 }))
+  } catch (err) {
+    text = String(err?.stderr || '')
+  }
+  const hit = text.match(/(\d{2,5})x(\d{2,5})/)
+  if (!hit) return null
+  const width = Number(hit[1])
+  const height = Number(hit[2])
+  return width && height ? { width, height } : null
+}
+
 export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
   const resolved = await resolveDouyinWithBrowser(input, { signal })
   const id = douyinVideoId(input)
@@ -1285,11 +1400,12 @@ export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
     signal,
     idleMs,
   })
+  const dims = probeVideoDims(filePath)
   return {
     backend: 'douyin-browser',
     savedTo: filePath,
     bytes,
-    quality: resolved.quality,
+    quality: dims ? `${Math.min(dims.width, dims.height)}P` : resolved.quality,
     title: resolved.title,
     sourceUrl: resolved.pageUrl,
   }
@@ -1416,31 +1532,28 @@ export function apply(ctx) {
           return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
         }
         if (route === 'ytdlp') {
-          let douyinErr = null
           if (detectSite(url) === 'douyin') {
             try {
               const info = await downloadDouyin(url, { outPath: args.outPath, signal: controller.signal })
               return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
             } catch (err) {
-              douyinErr = err
+              // 抖音走 yt-dlp 基本必 403 且会卡上分钟，只有「没浏览器」才值得回退
+              if (err?.code !== 'backend_missing') {
+                return JSON.stringify({
+                  error: err?.code || 'download_failed',
+                  message: err?.message || String(err),
+                  elapsedMs: Date.now() - started,
+                })
+              }
             }
           }
-          try {
-            const info = await downloadWithYtDlp(url, {
-              outPath: args.outPath,
-              cookies: args.cookies,
-              quality: args.quality || 'best',
-              signal: controller.signal,
-            })
-            return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
-          } catch (err) {
-            if (!douyinErr) throw err
-            return JSON.stringify({
-              error: err?.code || 'download_failed',
-              message: `浏览器通路：${douyinErr.message}；yt-dlp：${err?.message || String(err)}`,
-              elapsedMs: Date.now() - started,
-            })
-          }
+          const info = await downloadWithYtDlp(url, {
+            outPath: args.outPath,
+            cookies: args.cookies,
+            quality: args.quality || 'best',
+            signal: controller.signal,
+          })
+          return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
         }
         if (route === 'none') {
           return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
