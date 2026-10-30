@@ -2,15 +2,15 @@
 
 DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链接就能下载，不需要先拿到直链。
 
-面向 **DSH 0.2.1-rc.2** 重写，两条链路：B 站走内置解析（不依赖外部程序），其他站点交给本机通用后端 yt-dlp。
+面向 **DSH 0.2.1-rc.2** 重写，三条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端 yt-dlp。
 
 ## 功能
 
 | 工具 | 作用 |
 | --- | --- |
 | `video_analyze` | 判断链接类型与由哪个后端处理：`bilibili` / `ytdlp` / `direct` / `unsupported`，给出站点、扩展名、MIME 提示。纯本地计算 |
-| `video_resolve` | 把页面链接解析成流清单，不下载：B 站走内置解析，其他站点走 yt-dlp |
-| `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；其他站点页面链接交给 yt-dlp |
+| `video_resolve` | 把页面链接解析成流清单，不下载：B 站走内置解析，抖音走本地浏览器通路，其他站点走 yt-dlp |
+| `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；抖音用本地浏览器取播放流直下；其他站点页面链接交给 yt-dlp |
 | `video_quality_parse` | 从 URL 参数推断画质与容器格式，纯本地计算 |
 
 ## 使用示例
@@ -26,7 +26,7 @@ video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\
 
 `video_download` 返回 JSON：`savedTo`（落盘路径）、`bytes`、`backend`（`bilibili` / `ytdlp` / `direct`）、`quality`、`title`、`elapsedMs`；失败返回 `{ "error": "...", "message": "..." }`，不会把异常抛到会话里。
 
-`error` 取值：`unsupported`（插件不处理这类链接）、`need_login`（要登录态，给 `cookies` 再试）、`blocked`（风控/403/429）、`unavailable`（视频已删除或地区限制）、`not_found`（404）、`network`、`missing_ffmpeg`、`backend_missing`（没装 yt-dlp）。
+`error` 取值：`unsupported`（插件不处理这类链接）、`need_login`（要登录态，给 `cookies` 再试）、`blocked`（风控/403/429，含抖音的 Argus 拦截）、`unavailable`（视频已删除或地区限制）、`not_found`（404）、`network`、`missing_ffmpeg`、`backend_missing`（没装 yt-dlp 或找不到浏览器）、`no_stream`（播放页没给出可下载地址）。
 
 ## 下载位置
 
@@ -62,11 +62,25 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 找不到时不会静默失败：音视频分别落盘，返回值里 `muxed: false` 并给出合并命令；只有单条流的站点不需要 ffmpeg。
 
+## 抖音通路
+
+抖音的详情接口要 UIFID 与签名，yt-dlp 无 Cookie 时直接 403。插件改走**本机无头浏览器**：
+
+1. 链接先归一：个人页 `?modal_id=<id>`、分享文本、`/video/<id>` 都折成 `https://www.douyin.com/video/<id>`；
+2. 起一个 Edge/Chrome 的 `--headless=new` 实例，用 CDP 打开播放页，读 `<video>` 的 `currentSrc`（并用资源计时表交叉验证）；
+3. 页面偶尔先给出几秒钟的试看流，因此对所有候选地址各发一次 1 字节请求比体积，取最大的那条；
+4. 带宽走 `Referer: https://www.douyin.com/` 直接下载，**不经过系统代理**（代理会让抖音接口 403）。
+
+浏览器查找顺序：`DSH_BROWSER_PATH` → 常见 Edge/Chrome 安装路径。找不到时退回 yt-dlp，两条路都失败才报错（`error: "no_stream"` 表示页面没给出播放地址，通常要登录或作品已失效）。
+
+浏览器通路失败不会让请求直接失败：仍会退回 yt-dlp，错误消息里同时给出两条路的原因。
+
 ## 支持范围
 
 - **B 站**：BV 号、标准页面链接、`b23.tv` 短链、多 P（`?p=`）。走内置解析，匿名最高 480P；1080P 及以上要登录态，本版本不带账号态。
-- **直链媒体**：mp4 / m4s / webm / mkv / flv / ts / m3u8 / mpd 等，按扩展名与 Content-Type 判定，原生下载。
-- **其他站点**：交给 yt-dlp，覆盖其支持的全部站点（抖音、小红书、YouTube、快手、Vimeo 等）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
+- **抖音**：`/video/<id>`、个人页 `?modal_id=<id>`、分享文本里的链接都认；走本地浏览器通路，默认不需要 Cookie、不需要登录，公开作品即可下。直播、会员、私密作品不处理。
+- **直链媒体**：mp4 / m4s / webm / mkv / flv / ts 按扩展名与 Content-Type 判定，原生下载；m3u8 / mpd 是播放列表不是媒体本身，交给 yt-dlp 拉流合并，不再当成视频文件直接存盘。
+- **其他站点**：交给 yt-dlp，覆盖其支持的全部站点（小红书、YouTube、快手、Vimeo 等）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
 - **不做**：DRM 内容、付费墙绕过。
 
 ## 安装
@@ -108,7 +122,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test test/index.test.js
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp 错误归因、四个工具的注册与错误分支。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp 错误归因、抖音链接归一与播放列表分流、四个工具的注册与错误分支。
 
 ## 许可证
 

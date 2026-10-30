@@ -19,12 +19,14 @@
  * Schema, which is exactly what `ctx.tools.register()` consumes.
  */
 
-import { createWriteStream, mkdirSync, statSync } from 'node:fs'
+import { createWriteStream, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { renameSync, unlinkSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
+import { createServer } from 'node:net'
 import { Readable } from 'node:stream'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 
 export const name = 'dsh-video-downloader'
 export const inject = ['tools']
@@ -135,7 +137,9 @@ export function getQuality(url) {
   if (m) return m[2] + 'P'
   m = url.match(/[?&](bitrate|br)=(\d+)/i)
   if (m) {
-    const br = parseInt(m[2], 10)
+    // 有的 CDN（抖音 douyinvod 就是）按 kbps 给码率，不足 100000 时按 kbps 还原
+    let br = parseInt(m[2], 10)
+    if (br < 100000) br *= 1000
     if (br > 8000000) return '4K'
     if (br > 5000000) return '1080P'
     if (br > 2000000) return '720P'
@@ -199,6 +203,38 @@ export function extractPage(input) {
 }
 
 /**
+ * Nineteen-digit Douyin aweme id out of any shape Douyin hands out: a bare id,
+ * `?modal_id=` on a profile page, `/video/<id>`, `/share/video/<id>`, a note,
+ * or a share sentence with the link pasted inside it.
+ */
+export function douyinVideoId(input) {
+  const s = String(input ?? '').trim()
+  if (!s) return ''
+  if (/^\d{19}$/.test(s)) return s
+  const q = s.match(/[?&#](?:modal_id|vid|aweme_id|item_id)=(\d{15,20})/i)
+  if (q) return q[1]
+  const p = s.match(/\/(?:share\/)?(?:video|note|slides?)\/(\d{15,20})/)
+  if (p) return p[1]
+  const any = s.match(/(?:^|\D)(\d{19})(?:\D|$)/)
+  return any ? any[1] : ''
+}
+
+/** Canonical Douyin video page for any shareable Douyin shape (unchanged when none). */
+export function normalizeDouyinUrl(input) {
+  const s = String(input ?? '').trim()
+  if (!s) return ''
+  if (detectSite(s) !== 'douyin') return s
+  const id = douyinVideoId(s)
+  return id ? `https://www.douyin.com/video/${id}` : s
+}
+
+/** A playlist URL is not a file: streaming it would only save the playlist text. */
+export function isPlaylistUrl(url) {
+  const ext = getExt(url)
+  return ext === 'm3u8' || ext === 'mpd'
+}
+
+/**
  * True when the input addresses a page that still has to be resolved into
  * media streams (Bilibili video page / short link / bare BV id).
  */
@@ -219,10 +255,11 @@ export function isResolvablePage(input) {
 
 /** Which engine should handle this input: bilibili | direct | ytdlp | unsupported | none. */
 export function routeFor(input) {
-  const s = String(input ?? '').trim()
-  if (!s) return 'none'
+  const raw = String(input ?? '').trim()
+  if (!raw) return 'none'
+  const s = normalizeDouyinUrl(raw)
   if (isResolvablePage(s)) return 'bilibili'
-  if (isMedia(s)) return 'direct'
+  if (isMedia(s)) return isPlaylistUrl(s) ? 'ytdlp' : 'direct'
   if (!/^https?:\/\//i.test(s)) return 'none'
   if (detectSite(s) === 'bilibili') return 'unsupported'
   return 'ytdlp'
@@ -235,6 +272,7 @@ export function analyze(url) {
   const site = detectSite(u)
   const backend = routeFor(u)
   const isPage = backend === 'bilibili' || backend === 'ytdlp'
+  const normalized = normalizeDouyinUrl(u)
   return {
     isMedia: isMedia(u),
     site,
@@ -243,11 +281,16 @@ export function analyze(url) {
     mimeHint: mimeHintOf(ext),
     backend,
     kind: isPage ? 'page' : backend === 'direct' ? 'direct' : 'unknown',
+    normalizedUrl: normalized !== String(url).trim() ? normalized : undefined,
     hint:
       backend === 'bilibili'
         ? 'B站 视频页面链接：video_resolve 可先看有哪些流，video_download 能直接解析并下载。'
         : backend === 'ytdlp'
-          ? '站点页面链接：交给通用后端（本机 yt-dlp）解析与下载，不要求直链。'
+          ? site === 'douyin'
+            ? '抖音页面：video_download 先用本地浏览器通路取播放源（不吃 Cookie），失败再退回 yt-dlp。'
+            : isPlaylistUrl(u)
+              ? '播放列表（m3u8/mpd）：交给合并后端抓分片，不要当普通文件存。'
+              : '站点页面链接：交给通用后端（本机 yt-dlp）解析与下载，不要求直链。'
           : backend === 'direct'
             ? '看起来是可直接下载的媒体链接。'
             : backend === 'unsupported'
@@ -773,6 +816,7 @@ export function findYtDlp() {
 export function classifyYtDlpError(text) {
   const s = String(text || '')
   if (/Unsupported URL|is not a valid URL|no suitable InfoExtractor/i.test(s)) return 'unsupported'
+  if (/Blocked by ArgusSecurityPlugin|Uifid Not Found|verify the signature|invalid signature/i.test(s)) return 'blocked'
   if (/This video is unavailable|Video unavailable|has been removed|This video is private|not available in your country/i.test(s)) return 'unavailable'
   if (/Sign in to confirm|Please sign in|log ?in|Login required|members-only|This video is only available|confirm your age|cookies/i.test(s)) return 'need_login'
   if (/HTTP Error 404|404: Not Found/i.test(s)) return 'not_found'
@@ -793,7 +837,12 @@ function ytdlpMessage(stderr, code) {
 
 function ytdlpArgs(url, { cookies } = {}) {
   const args = ['--no-playlist', '--no-warnings', '--no-mtime', '--newline']
-  if (process.env.DSH_YTDLP_PROXY) args.push('--proxy', process.env.DSH_YTDLP_PROXY)
+  const explicit = (process.env.DSH_YTDLP_PROXY || '').trim()
+  if (explicit) args.push('--proxy', explicit)
+  // Douyin rejects requests that arrive through a desktop system proxy with
+  // `Blocked by ArgusSecurityPlugin`; ask for a direct connection there unless
+  // the caller pinned a proxy explicitly.
+  else if (detectSite(url) === 'douyin') args.push('--proxy', '')
   if (cookies) args.push('--cookies', cookies)
   args.push(url)
   return args
@@ -915,6 +964,337 @@ export async function downloadWithYtDlp(input, { outPath, cookies, signal, quali
   }
 }
 
+// ------------------------------------------------------- douyin browser backend
+// Douyin's detail API answers 403 unless a signed, cookie-bearing request comes
+// in, and the video page is a SPA whose HTML ships no media URL at all. The one
+// route that works without a login is a real browser: open the page, let its
+// player pick a source, then read that source off the <video> element. The URL
+// carries a short-lived signature, so it is used for one download and dropped.
+
+const EDGE_CANDIDATES = [
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+]
+
+const DOUYIN_SRC_EXPR = [
+  '(() => {',
+  "  const v = document.querySelector('video')",
+  '  const src = (v && (v.currentSrc || v.src)) || ""',
+  '  const width = (v && v.videoWidth) || 0',
+  '  const height = (v && v.videoHeight) || 0',
+  '  const duration = (v && isFinite(v.duration) && v.duration) || 0',
+  '  const title = (document.title || "").replace(/\\s*-\\s*抖音\\s*$/, "").trim()',
+  '  const list = []',
+  '  if (src) list.push(src)',
+  '  performance.getEntriesByType("resource").map((e) => e.name)',
+  '    .filter((n) => /douyinvod|\\/video\\/tos\\//.test(n) && /mime_type=video_mp4|\\.mp4/.test(n))',
+  '    .forEach((n) => { if (!list.includes(n)) list.push(n) })',
+  '  return { src, candidates: list, width, height, duration, title }',
+  '})()',
+].join('\n')
+
+/** 一次要一个字节，从 Content-Range 里读回总量 —— 用来在候选流里挑最大的那条。 */
+async function probeContentSize(url, { signal, timeoutMs = 6000 } = {}) {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Range: 'bytes=0-0',
+        Referer: 'https://www.douyin.com/',
+        'User-Agent': BROWSER_UA,
+      },
+      redirect: 'follow',
+      signal: signal ?? AbortSignal.timeout(timeoutMs),
+    })
+    await res.arrayBuffer().catch(() => {})
+    const range = res.headers.get('content-range') || ''
+    const m = range.match(/\/(\d+)\s*$/)
+    if (m) return parseInt(m[1], 10)
+    const len = res.headers.get('content-length')
+    return len ? parseInt(len, 10) : 0
+  } catch {
+    return 0
+  }
+}
+
+const DOUYIN_DIM_EXPR = [
+  '(() => {',
+  "  const v = document.querySelector('video')",
+  '  if (!v) return { width: 0, height: 0 }',
+  '  return { width: v.videoWidth || 0, height: v.videoHeight || 0 }',
+  '})()',
+].join('\n')
+
+const delay = (ms) => new Promise((done) => setTimeout(done, ms))
+
+let browserProbe = null
+
+/** Locate the browser used for the Douyin path; '' when none is installed. */
+export function findBrowser() {
+  if (browserProbe !== null) return browserProbe
+  const envPath = (process.env.DSH_BROWSER_PATH || '').trim()
+  if (envPath) {
+    browserProbe = envPath
+    return browserProbe
+  }
+  browserProbe = ''
+  for (const candidate of EDGE_CANDIDATES) {
+    if (existsSync(candidate)) {
+      browserProbe = candidate
+      break
+    }
+  }
+  return browserProbe
+}
+
+/** One free loopback port for the debugging endpoint. */
+function freePort() {
+  return new Promise((done, fail) => {
+    const server = createServer()
+    server.once('error', fail)
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      server.close(() => done(port))
+    })
+  })
+}
+
+async function waitForDevtools(port, deadline) {
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) })
+      if (res.ok) {
+        const info = await res.json()
+        if (info && info.webSocketDebuggerUrl) return info
+      }
+    } catch {
+      // the browser is still starting
+    }
+    await delay(250)
+  }
+  throw new Error('浏览器调试端口没有起来')
+}
+
+/** Minimal CDP client: request/response over one flat WebSocket. */
+function openCdp(wsUrl) {
+  return new Promise((done, fail) => {
+    let ws
+    try {
+      ws = new WebSocket(wsUrl)
+    } catch (err) {
+      fail(err)
+      return
+    }
+    const pending = new Map()
+    let seq = 0
+    const abortAll = (err) => {
+      for (const item of pending.values()) item.reject(err)
+      pending.clear()
+      fail(err)
+    }
+    ws.addEventListener('open', () => {
+      done({
+        send(method, params = {}, sessionId) {
+          const id = ++seq
+          const payload = { id, method, params }
+          if (sessionId) payload.sessionId = sessionId
+          return new Promise((res, rej) => {
+            pending.set(id, { res, rej })
+            ws.send(JSON.stringify(payload))
+          })
+        },
+        close() {
+          try {
+            ws.close()
+          } catch {
+            // already gone
+          }
+        },
+      })
+    })
+    ws.addEventListener('message', (ev) => {
+      let msg
+      try {
+        msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '')
+      } catch {
+        return
+      }
+      if (!msg || !msg.id || !pending.has(msg.id)) return
+      const item = pending.get(msg.id)
+      pending.delete(msg.id)
+      if (msg.error) item.reject(new Error(msg.error.message || 'CDP 调用失败'))
+      else item.res(msg.result)
+    })
+    ws.addEventListener('error', () => abortAll(new Error('CDP 连接失败')))
+    ws.addEventListener('close', () => abortAll(new Error('CDP 连接已关闭')))
+  })
+}
+
+async function evalIn(call, expression) {
+  try {
+    const res = await call('Runtime.evaluate', { expression, returnByValue: true })
+    return res?.result?.value
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Open a Douyin video page in a throwaway headless browser and read the playing
+ * source off the player. Returns the signed media URL; nothing is written to the
+ * plugin's own storage.
+ */
+export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_000 } = {}) {
+  const pageUrl = normalizeDouyinUrl(input)
+  const bin = findBrowser()
+  if (!bin) {
+    const err = new Error('本机没有找到 Edge/Chrome，抖音这条通路需要浏览器；可用 DSH_BROWSER_PATH 指定路径。')
+    err.code = 'backend_missing'
+    throw err
+  }
+  if (signal?.aborted) throw new Error('执行已取消')
+
+  const port = await freePort()
+  const profileDir = mkdtempSync(join(tmpdir(), 'dsh-douyin-'))
+  const child = spawn(
+    bin,
+    [
+      '--headless=new',
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profileDir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-gpu',
+      '--mute-audio',
+      '--disable-blink-features=AutomationControlled',
+      'about:blank',
+    ],
+    { stdio: 'ignore', windowsHide: true },
+  )
+
+  try {
+    const { webSocketDebuggerUrl } = await waitForDevtools(port, Date.now() + 20_000)
+    const cdp = await openCdp(webSocketDebuggerUrl)
+    try {
+      const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' })
+      const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
+      const call = (method, params) => cdp.send(method, params, sessionId)
+      await call('Page.enable', {})
+      await call('Runtime.enable', {})
+      await call('Page.navigate', { url: pageUrl })
+
+      let mediaUrl = ''
+      let title = ''
+      let width = 0
+      let height = 0
+      let duration = 0
+      let contentBytes = 0
+      let candidates = []
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        if (signal?.aborted) throw new Error('执行已取消')
+        const probe = await evalIn(call, DOUYIN_SRC_EXPR)
+        if (probe && typeof probe === 'object') {
+          title = String(probe.title || '') || title
+          width = Number(probe.width) || width
+          height = Number(probe.height) || height
+          duration = Number(probe.duration) || duration
+          candidates = Array.isArray(probe.candidates)
+            ? probe.candidates.filter((u) => /^https?:\/\//i.test(u))
+            : []
+        } else if (typeof probe === 'string' && /^https?:\/\//i.test(probe)) {
+          candidates = [probe]
+        }
+        if (candidates.length) break
+        await delay(500)
+      }
+      if (!candidates.length) {
+        const err = new Error('播放页在时限内没有给出可下载地址（可能需要登录，或这个作品已失效）')
+        err.code = 'no_stream'
+        throw err
+      }
+      // 页面偶尔先给出的是几秒钟的试看流：按体积挑最大的那条
+      mediaUrl = candidates[0]
+      if (candidates.length > 1) {
+        const sized = []
+        for (const u of candidates.slice(0, 4)) sized.push({ u, size: await probeContentSize(u, { signal }) })
+        sized.sort((a, b) => b.size - a.size)
+        mediaUrl = sized[0].size ? sized[0].u : candidates[0]
+        contentBytes = sized[0].size || 0
+      }
+      // 直链先出现、<video> 的元数据后到，补齐真实分辨率（用于 quality 标签）
+      if (!height) {
+        const dimDeadline = Date.now() + 4000
+        while (Date.now() < dimDeadline) {
+          const dim = await evalIn(call, DOUYIN_DIM_EXPR)
+          const h = Number(dim?.height) || 0
+          if (h) {
+            height = h
+            width = Number(dim?.width) || 0
+            break
+          }
+          await delay(300)
+        }
+      }
+      return {
+        backend: 'douyin-browser',
+        pageUrl,
+        mediaUrl,
+        title,
+        width,
+        height,
+        duration,
+        bytes: contentBytes,
+        candidates: candidates.length,
+        quality: width && height ? `${Math.min(width, height)}P` : getQuality(mediaUrl),
+      }
+    } finally {
+      cdp.close()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      // already exited
+    }
+    await delay(300)
+    for (let i = 0; i < 6; i++) {
+      try {
+        rmSync(profileDir, { recursive: true, force: true })
+        break
+      } catch {
+        await delay(300)
+      }
+    }
+  }
+}
+
+/** Resolve a Douyin page through the browser and save the file it points at. */
+export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
+  const resolved = await resolveDouyinWithBrowser(input, { signal })
+  const id = douyinVideoId(input)
+  const stem = sanitizeName(resolved.title || id || 'douyin')
+  const target =
+    outPath && isAbsolute(outPath)
+      ? `${outPath.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp4`
+      : join(defaultDownloadDir(), `${stem}${id ? `_${id}` : ''}.mp4`)
+  const { filePath, bytes } = await downloadMedia(resolved.mediaUrl, {
+    outPath: target,
+    headers: { Referer: 'https://www.douyin.com/' },
+    signal,
+    idleMs,
+  })
+  return {
+    backend: 'douyin-browser',
+    savedTo: filePath,
+    bytes,
+    quality: resolved.quality,
+    title: resolved.title,
+    sourceUrl: resolved.pageUrl,
+  }
+}
+
 // -------------------------------------------------------------------- tools
 
 const renderText = (_args, value) => [{ type: 'text', text: value }]
@@ -943,10 +1323,12 @@ export function apply(ctx) {
     name: 'video_resolve',
     description:
       '把视频页面链接解析成真实媒体流，不下载。B站 视频页/BV 号/b23.tv 短链走内置解析；' +
-      '其他站点（抖音、小红书、YouTube、快手等）交给本机通用后端 yt-dlp 解析。' +
+      '抖音页面（含个人页 ?modal_id=、短链、分享文本）先用本地浏览器通路取播放源，再退回 yt-dlp；' +
+      '其他站点（小红书、YouTube、快手等）交给本机通用后端 yt-dlp 解析。' +
       'B站 返回 { site, bvid, cid, page, title, durationSec, qualities[], video{...}, audio{...}, requiresMux, expiresAt }；' +
+      '抖音返回 { backend:"douyin-browser", pageUrl, title, qualities[] }；' +
       '通用后端返回 { backend:"ytdlp", site, title, uploader, durationSec, qualities[], audioOnly }。' +
-      '成功返回解析结果；失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / backend_missing。',
+      '成功返回解析结果；失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / backend_missing / no_stream。',
     parameters: {
       url: { type: 'string', required: true, description: '视频页面链接、BV 号或 b23.tv 短链。' },
       quality: { type: 'string', description: '清晰度偏好：best（默认）/ worst / 数字质量 id（如 64）。' },
@@ -961,6 +1343,27 @@ export function apply(ctx) {
           return JSON.stringify(info, null, 2)
         }
         if (routeFor(url) === 'ytdlp') {
+          if (detectSite(url) === 'douyin') {
+            try {
+              const page = await resolveDouyinWithBrowser(url, { signal: exec?.signal })
+              return JSON.stringify(
+                {
+                  backend: 'douyin-browser',
+                  site: 'douyin',
+                  pageUrl: page.pageUrl,
+                  title: page.title,
+                  durationSec: 0,
+                  qualities: [{ formatId: 'browser', ext: 'mp4', quality: page.quality }],
+                  audioOnly: false,
+                  note: '这是浏览器通路取到的播放源（带时效签名，不落盘）；下载请用 video_download 给同一个页面链接。',
+                },
+                null,
+                2,
+              )
+            } catch {
+              // Douyin also has a yt-dlp extractor; try it before giving up.
+            }
+          }
           const info = await resolveWithYtDlp(url, { cookies: args.cookies, signal: exec?.signal })
           return JSON.stringify(info, null, 2)
         }
@@ -977,8 +1380,10 @@ export function apply(ctx) {
       '把视频下载到本机，接受三类输入：①媒体直链（mp4/m3u8/mpd/flv/m4s/音频）直接下；' +
       '②B站 视频页面链接 / BV 号 / b23.tv 短链，内置解析 + ffmpeg 合并；' +
       '③其他站点页面链接（抖音、小红书、YouTube、快手等），交给本机通用后端 yt-dlp 下载。' +
+      '抖音（含个人页 ?modal_id=、短链、分享文本）先用无头浏览器取播放源、不吃 Cookie；' +
+      'm3u8/mpd 播放列表交给合并后端抓分片，不会把播放列表文本当成视频存下来。' +
       '返回 JSON { savedTo, bytes, quality, backend, title?, elapsedMs }；savedTo 是真实绝对路径。' +
-      '失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / missing_ffmpeg / backend_missing / download_failed。' +
+      '失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / missing_ffmpeg / backend_missing / no_stream / download_failed。' +
       '默认目录：$DSH_VIDEO_DOWNLOAD_DIR，未设置时为用户 Downloads/dsh-video-downloader。',
     parameters: {
       url: { type: 'string', required: true, description: '媒体直链、B站 视频页链接，或其他站点的视频页面链接。' },
@@ -1011,13 +1416,31 @@ export function apply(ctx) {
           return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
         }
         if (route === 'ytdlp') {
-          const info = await downloadWithYtDlp(url, {
-            outPath: args.outPath,
-            cookies: args.cookies,
-            quality: args.quality || 'best',
-            signal: controller.signal,
-          })
-          return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
+          let douyinErr = null
+          if (detectSite(url) === 'douyin') {
+            try {
+              const info = await downloadDouyin(url, { outPath: args.outPath, signal: controller.signal })
+              return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
+            } catch (err) {
+              douyinErr = err
+            }
+          }
+          try {
+            const info = await downloadWithYtDlp(url, {
+              outPath: args.outPath,
+              cookies: args.cookies,
+              quality: args.quality || 'best',
+              signal: controller.signal,
+            })
+            return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
+          } catch (err) {
+            if (!douyinErr) throw err
+            return JSON.stringify({
+              error: err?.code || 'download_failed',
+              message: `浏览器通路：${douyinErr.message}；yt-dlp：${err?.message || String(err)}`,
+              elapsedMs: Date.now() - started,
+            })
+          }
         }
         if (route === 'none') {
           return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })

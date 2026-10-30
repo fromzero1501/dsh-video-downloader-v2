@@ -5,12 +5,15 @@ import {
   analyze,
   classifyYtDlpError,
   detectSite,
+  douyinVideoId,
   extractBvid,
   extractPage,
   getExt,
   getQuality,
   isMedia,
+  isPlaylistUrl,
   isResolvablePage,
+  normalizeDouyinUrl,
   pickAudioTrack,
   pickVideoTrack,
   routeFor,
@@ -190,4 +193,46 @@ test('video_download reports a readable error for a non-video Bilibili link', as
   const tool = ctx.get('video_download')
   const out = JSON.parse(await tool.execute({ url: 'https://www.bilibili.com/read/cv123' }))
   assert.equal(out.error, 'unsupported')
+})
+
+test('douyinVideoId reads the id out of every shape Douyin shares', () => {
+  const id = '7575127409680256955'
+  assert.equal(douyinVideoId(id), id)
+  assert.equal(douyinVideoId(`https://www.douyin.com/user/self?modal_id=${id}&showTab=like`), id)
+  assert.equal(douyinVideoId(`https://www.douyin.com/video/${id}`), id)
+  assert.equal(douyinVideoId(`https://www.iesdouyin.com/share/video/${id}/?region=CN`), id)
+  assert.equal(douyinVideoId(`看看这个 https://www.douyin.com/video/${id} 复制打开抖音`), id)
+  assert.equal(douyinVideoId('https://www.douyin.com/user/self?showTab=like'), '')
+})
+
+test('normalizeDouyinUrl turns a profile-with-modal link into a canonical video page', () => {
+  const id = '7575127409680256955'
+  assert.equal(
+    normalizeDouyinUrl(`https://www.douyin.com/user/self?modal_id=${id}&showTab=like`),
+    `https://www.douyin.com/video/${id}`,
+  )
+  // non-Douyin input is handed back untouched
+  assert.equal(normalizeDouyinUrl('https://example.com/a.mp4'), 'https://example.com/a.mp4')
+})
+
+test('analyze exposes normalizedUrl for a Douyin profile-with-modal link', () => {
+  const id = '7575127409680256955'
+  const out = analyze(`https://www.douyin.com/user/self?modal_id=${id}&showTab=like`)
+  assert.equal(out.site, 'douyin')
+  assert.equal(out.kind, 'page')
+  assert.equal(out.normalizedUrl, `https://www.douyin.com/video/${id}`)
+})
+
+test('routeFor sends playlists to the merging backend instead of raw streaming', () => {
+  assert.equal(isPlaylistUrl('https://example.com/live/index.m3u8'), true)
+  assert.equal(isPlaylistUrl('https://example.com/live/index.mpd'), true)
+  assert.equal(isPlaylistUrl('https://example.com/a.mp4'), false)
+  assert.equal(routeFor('https://example.com/live/index.m3u8'), 'ytdlp')
+  assert.equal(routeFor('https://example.com/live/index.mpd'), 'ytdlp')
+  assert.equal(routeFor('https://example.com/a.mp4'), 'direct')
+})
+
+test('classifyYtDlpError treats the Argus rejection as blocked', () => {
+  assert.equal(classifyYtDlpError('Blocked by ArgusSecurityPlugin Uifid Not Found'), 'blocked')
+  assert.equal(classifyYtDlpError('HTTP Error 403: Forbidden'), 'blocked')
 })
