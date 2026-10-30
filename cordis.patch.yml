@@ -1,0 +1,3 @@
+- insert:
+    - id: video-downloader
+      name: dsh-video-downloader
