@@ -7,9 +7,9 @@
  *                no I/O. Everything here is exported and unit-tested.
  *   tool layer — four agent-callable tools registered on `ctx.tools`:
  *
- *     video_analyze        classify a URL (media? which site? quality? ext?)
- *     video_resolve        page URL -> real media streams (Bilibili, anonymous)
- *     video_download       direct media URL or a Bilibili page URL -> file(s) on disk
+ *     video_analyze        classify a URL (media? page? which site? quality? ext?)
+ *     video_resolve        page URL -> real media streams (Bilibili built-in, others via yt-dlp)
+ *     video_download       direct media URL, a Bilibili page URL, or any yt-dlp-supported page -> file on disk
  *     video_quality_parse  pure regex quality/extension extraction
  *
  * The plugin depends on no kernel package at import time: profile bundles are
@@ -19,7 +19,7 @@
  * Schema, which is exactly what `ctx.tools.register()` consumes.
  */
 
-import { createWriteStream, mkdirSync } from 'node:fs'
+import { createWriteStream, mkdirSync, statSync } from 'node:fs'
 import { renameSync, unlinkSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
@@ -217,24 +217,42 @@ export function isResolvablePage(input) {
   }
 }
 
+/** Which engine should handle this input: bilibili | direct | ytdlp | unsupported | none. */
+export function routeFor(input) {
+  const s = String(input ?? '').trim()
+  if (!s) return 'none'
+  if (isResolvablePage(s)) return 'bilibili'
+  if (isMedia(s)) return 'direct'
+  if (!/^https?:\/\//i.test(s)) return 'none'
+  if (detectSite(s) === 'bilibili') return 'unsupported'
+  return 'ytdlp'
+}
+
 /** One-line classification used by `video_analyze`. */
 export function analyze(url) {
   const u = String(url)
   const ext = getExt(u)
   const site = detectSite(u)
-  const resolvable = isResolvablePage(u)
+  const backend = routeFor(u)
+  const isPage = backend === 'bilibili' || backend === 'ytdlp'
   return {
     isMedia: isMedia(u),
     site,
     quality: getQuality(u),
     ext,
     mimeHint: mimeHintOf(ext),
-    kind: resolvable ? 'page' : isMedia(u) ? 'direct' : 'unknown',
-    hint: resolvable
-      ? '这是站点页面链接，先用 video_resolve 取真实媒体流，或直接交给 video_download（它会自己解析）。'
-      : isMedia(u)
-        ? '看起来是可直接下载的媒体链接。'
-        : '既不是媒体直链，也不是可解析的站点页面。',
+    backend,
+    kind: isPage ? 'page' : backend === 'direct' ? 'direct' : 'unknown',
+    hint:
+      backend === 'bilibili'
+        ? 'B站 视频页面链接：video_resolve 可先看有哪些流，video_download 能直接解析并下载。'
+        : backend === 'ytdlp'
+          ? '站点页面链接：交给通用后端（本机 yt-dlp）解析与下载，不要求直链。'
+          : backend === 'direct'
+            ? '看起来是可直接下载的媒体链接。'
+            : backend === 'unsupported'
+              ? '这是 B站 的非视频页面（专栏/直播/空间），插件不支持。'
+              : '既不是媒体直链，也不是可识别的站点页面链接。',
   }
 }
 
@@ -723,6 +741,180 @@ export async function downloadBilibili(input, { outPath, signal, quality = 'best
   }
 }
 
+// ------------------------------------------------------------- yt-dlp backend
+// Everything that is not Bilibili and not a direct media URL goes through the
+// local yt-dlp binary: it owns per-site extraction, signature logic and login
+// state, so this plugin does not have to chase site changes.
+
+let ytdlpProbe = null
+
+/** Locate yt-dlp once; returns the command or '' when unavailable. */
+export function findYtDlp() {
+  if (ytdlpProbe !== null) return ytdlpProbe
+  const envPath = process.env.DSH_YTDLP_PATH
+  if (envPath) {
+    ytdlpProbe = envPath
+    return ytdlpProbe
+  }
+  ytdlpProbe = ''
+  for (const cmd of ['yt-dlp', 'yt-dlp.exe']) {
+    try {
+      execFileSync(cmd, ['--version'], { stdio: 'ignore', timeout: 8000 })
+      ytdlpProbe = cmd
+      break
+    } catch {
+      // try the next candidate
+    }
+  }
+  return ytdlpProbe
+}
+
+/** Map yt-dlp stderr onto a small, agent-readable error code. */
+export function classifyYtDlpError(text) {
+  const s = String(text || '')
+  if (/Unsupported URL|is not a valid URL|no suitable InfoExtractor/i.test(s)) return 'unsupported'
+  if (/This video is unavailable|Video unavailable|has been removed|This video is private|not available in your country/i.test(s)) return 'unavailable'
+  if (/Sign in to confirm|Please sign in|log ?in|Login required|members-only|This video is only available|confirm your age|cookies/i.test(s)) return 'need_login'
+  if (/HTTP Error 404|404: Not Found/i.test(s)) return 'not_found'
+  if (/HTTP Error 40[13]|HTTP Error 429|Too Many Requests|Forbidden/i.test(s)) return 'blocked'
+  if (/ffmpeg (?:not found|is not installed)|ffprobe/i.test(s)) return 'missing_ffmpeg'
+  if (/Unable to download|timed out|Connection|getaddrinfo|Temporary failure|network/i.test(s)) return 'network'
+  return 'download_failed'
+}
+
+/** Keep only the meaningful tail of yt-dlp stderr (drops Python deprecation noise). */
+function ytdlpMessage(stderr, code) {
+  const lines = String(stderr || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^Deprecated Feature/i.test(l) && !/^WARNING:/i.test(l))
+  return lines.slice(-3).join(' ') || `yt-dlp 退出码 ${code}`
+}
+
+function ytdlpArgs(url, { cookies } = {}) {
+  const args = ['--no-playlist', '--no-warnings', '--no-mtime', '--newline']
+  if (process.env.DSH_YTDLP_PROXY) args.push('--proxy', process.env.DSH_YTDLP_PROXY)
+  if (cookies) args.push('--cookies', cookies)
+  args.push(url)
+  return args
+}
+
+function runYtDlp(bin, args, { signal } = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    // yt-dlp is a Python program: without these it writes console output in the
+    // Windows ANSI code page and any CJK title comes back as mojibake.
+    const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true, env })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (c) => {
+      stdout += c.toString()
+      if (stdout.length > 400_000) stdout = stdout.slice(-400_000)
+    })
+    child.stderr.on('data', (c) => {
+      stderr += c.toString()
+      if (stderr.length > 20_000) stderr = stderr.slice(-20_000)
+    })
+    child.on('error', (err) => rejectPromise(new Error(`无法启动 yt-dlp：${err.message}`)))
+    child.on('close', (code) => resolvePromise({ code, stdout, stderr }))
+  })
+}
+
+const YTDLP_FORMATS = {
+  best: 'bv*+ba/b',
+  worst: 'wv*+wa/w',
+}
+
+function formatSelector(quality) {
+  const q = String(quality || 'best').trim()
+  if (YTDLP_FORMATS[q]) return YTDLP_FORMATS[q]
+  if (/^\d+$/.test(q)) return `${q}+ba/${q}`
+  return YTDLP_FORMATS.best
+}
+
+/** Ask yt-dlp for metadata only (`-J`), without downloading. */
+export async function resolveWithYtDlp(input, { cookies, signal } = {}) {
+  const bin = findYtDlp()
+  if (!bin) throw new Error('本机没有找到 yt-dlp，无法解析这个站点。安装后重试，或用 DSH_YTDLP_PATH 指向 yt-dlp.exe。')
+  const { code, stdout, stderr } = await runYtDlp(bin, [...ytdlpArgs(input, { cookies }), '-J', '--skip-download'], { signal })
+  if (code !== 0) {
+    const err = new Error(ytdlpMessage(stderr, code))
+    err.code = classifyYtDlpError(stderr)
+    throw err
+  }
+  const info = JSON.parse(stdout)
+  const formats = Array.isArray(info.formats) ? info.formats : []
+  return {
+    backend: 'ytdlp',
+    site: info.extractor_key || info.extractor || 'unknown',
+    title: info.title,
+    uploader: info.uploader || info.channel || '',
+    durationSec: info.duration ?? 0,
+    webpageUrl: info.webpage_url || input,
+    thumbnail: info.thumbnail || '',
+    qualities: formats
+      .filter((f) => f.vcodec && f.vcodec !== 'none')
+      .map((f) => ({
+        formatId: f.format_id,
+        ext: f.ext,
+        height: f.height ?? null,
+        fps: f.fps ?? null,
+        codec: f.vcodec,
+        filesize: f.filesize ?? f.filesize_approx ?? null,
+      }))
+      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
+      .slice(0, 20),
+    audioOnly: formats.some((f) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')),
+    note: '这是通用后端的解析结果；下载请用 video_download 给同一个链接。',
+  }
+}
+
+/** Download any yt-dlp-supported page into the standard download directory. */
+export async function downloadWithYtDlp(input, { outPath, cookies, signal, quality = 'best' } = {}) {
+  const bin = findYtDlp()
+  if (!bin) {
+    const err = new Error('本机没有找到 yt-dlp，无法下载这个站点。安装后重试，或用 DSH_YTDLP_PATH 指向 yt-dlp.exe。')
+    err.code = 'backend_missing'
+    throw err
+  }
+  const dir = outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir()
+  mkdirSync(dir, { recursive: true })
+  const template = outPath && isAbsolute(outPath)
+    ? `${outPath.replace(/\.[a-z0-9]{1,5}$/i, '')}.%(ext)s`
+    : join(dir, '%(title).80s [%(id)s].%(ext)s')
+
+  const args = [
+    ...ytdlpArgs(input, { cookies }),
+    '-o', template,
+    '-f', formatSelector(quality),
+    '--merge-output-format', 'mp4',
+    '--print', 'before_dl:###TITLE###%(title)s',
+    '--print', 'after_move:filepath',
+  ]
+  const { code, stdout, stderr } = await runYtDlp(bin, args, { signal })
+  const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  const savedTo = [...lines].reverse().find((l) => isAbsolute(l))
+  const titleLine = lines.find((l) => l.startsWith('###TITLE###'))
+  if (code !== 0 || !savedTo) {
+    const err = new Error(ytdlpMessage(stderr, code))
+    err.code = classifyYtDlpError(stderr)
+    throw err
+  }
+  let bytes = 0
+  try {
+    bytes = statSync(savedTo).size
+  } catch {
+    // size is informative only
+  }
+  return {
+    backend: 'ytdlp',
+    savedTo,
+    bytes,
+    quality: String(quality || 'best'),
+    title: titleLine ? titleLine.slice('###TITLE###'.length) : '',
+  }
+}
+
 // -------------------------------------------------------------------- tools
 
 const renderText = (_args, value) => [{ type: 'text', text: value }]
@@ -734,9 +926,10 @@ export function apply(ctx) {
     name: 'video_analyze',
     description:
       '快速判断一个链接：是不是媒体、属于哪个站点（bilibili/youtube/douyin/xiaohongshu/other）、' +
-      '可能清晰度、容器扩展名与 mime 提示。纯分析，不联网。返回 JSON ' +
-      '{ isMedia, site, quality, ext, mimeHint, kind, hint }；kind=page 表示这是站点页面链接，' +
-      '需要 video_resolve 解析出真实媒体流，或直接交给 video_download。',
+      '会由哪个后端处理、可能清晰度、容器扩展名与 mime 提示。纯分析，不联网。返回 JSON ' +
+      '{ isMedia, site, quality, ext, mimeHint, backend, kind, hint }；backend=bilibili 走内置解析，' +
+      'backend=ytdlp 表示这是其他站点页面链接、交给本机通用后端，backend=direct 是媒体直链，' +
+      'backend=unsupported 是本插件不处理的情况。kind=page 的链接可以直接交给 video_download。',
     parameters: {
       url: { type: 'string', required: true, description: '要分析的链接（页面链接或媒体直链）。' },
     },
@@ -749,34 +942,50 @@ export function apply(ctx) {
   ctx.tools.register(defineTool({
     name: 'video_resolve',
     description:
-      '把 B站 视频页面链接 / BV 号 / b23.tv 短链解析成真实媒体流，不下载。' +
-      '返回 JSON { site, bvid, cid, page, title, durationSec, qualities[], video{qualityLabel,url,...}, ' +
-      'audio{url,...}, requiresMux, expiresAt }。匿名访问，最高清晰度受站点限制（通常 480P 以内）；' +
-      'requiresMux=true 表示音视频分离，下载时插件会用 ffmpeg 自动合并。' +
-      'URL 约 2 小时过期，过期后重新调用即可。',
+      '把视频页面链接解析成真实媒体流，不下载。B站 视频页/BV 号/b23.tv 短链走内置解析；' +
+      '其他站点（抖音、小红书、YouTube、快手等）交给本机通用后端 yt-dlp 解析。' +
+      'B站 返回 { site, bvid, cid, page, title, durationSec, qualities[], video{...}, audio{...}, requiresMux, expiresAt }；' +
+      '通用后端返回 { backend:"ytdlp", site, title, uploader, durationSec, qualities[], audioOnly }。' +
+      '成功返回解析结果；失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / backend_missing。',
     parameters: {
-      url: { type: 'string', required: true, description: 'B站视频页面链接、BV 号或 b23.tv 短链。' },
-      quality: { type: 'string', description: "清晰度偏好：best（默认）/ worst / 数字质量 id（如 64）。" },
+      url: { type: 'string', required: true, description: '视频页面链接、BV 号或 b23.tv 短链。' },
+      quality: { type: 'string', description: '清晰度偏好：best（默认）/ worst / 数字质量 id（如 64）。' },
+      cookies: { type: 'string', description: '可选：cookies.txt 的绝对路径，用于需要登录态的内容（B站 以外站点）。' },
     },
     output: OUTPUT,
     async execute(args, exec) {
-      const info = await resolveBilibili(String(args.url), { signal: exec?.signal, quality: args.quality || 'best' })
-      return JSON.stringify(info, null, 2)
+      const url = String(args.url).trim()
+      try {
+        if (isResolvablePage(url)) {
+          const info = await resolveBilibili(url, { signal: exec?.signal, quality: args.quality || 'best' })
+          return JSON.stringify(info, null, 2)
+        }
+        if (routeFor(url) === 'ytdlp') {
+          const info = await resolveWithYtDlp(url, { cookies: args.cookies, signal: exec?.signal })
+          return JSON.stringify(info, null, 2)
+        }
+        return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
+      } catch (err) {
+        return JSON.stringify({ error: err?.code || 'resolve_failed', message: err?.message || String(err) })
+      }
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'video_download',
     description:
-      '下载视频到本机。可以给媒体直链（mp4/m3u8/mpd/flv/m4s/音频），也可以直接给 B站 视频页面链接 / BV 号 / ' +
-      'b23.tv 短链——后者会先解析再下载，并用 ffmpeg 自动合并音视频。' +
-      '返回 JSON { savedTo, bytes, quality, title?, elapsedMs, ... }；savedTo 是真实绝对路径。' +
+      '把视频下载到本机，接受三类输入：①媒体直链（mp4/m3u8/mpd/flv/m4s/音频）直接下；' +
+      '②B站 视频页面链接 / BV 号 / b23.tv 短链，内置解析 + ffmpeg 合并；' +
+      '③其他站点页面链接（抖音、小红书、YouTube、快手等），交给本机通用后端 yt-dlp 下载。' +
+      '返回 JSON { savedTo, bytes, quality, backend, title?, elapsedMs }；savedTo 是真实绝对路径。' +
+      '失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / missing_ffmpeg / backend_missing / download_failed。' +
       '默认目录：$DSH_VIDEO_DOWNLOAD_DIR，未设置时为用户 Downloads/dsh-video-downloader。',
     parameters: {
-      url: { type: 'string', required: true, description: '媒体直链，或 B站 视频页面链接 / BV 号 / 短链。' },
+      url: { type: 'string', required: true, description: '媒体直链、B站 视频页链接，或其他站点的视频页面链接。' },
       outPath: { type: 'string', description: '可选保存路径；绝对路径按原样使用，相对路径相对默认下载目录。' },
-      quality: { type: 'string', description: 'B站 清晰度偏好：best（默认）/ worst / 数字质量 id。' },
-      headers: { type: 'object', additionalProperties: true, description: '可选额外请求头，叠加在内置浏览器 UA / Referer 之上。' },
+      quality: { type: 'string', description: '清晰度偏好：best（默认）/ worst / 数字质量 id。' },
+      cookies: { type: 'string', description: '可选：cookies.txt 的绝对路径，用于需要登录态的内容（B站 以外站点）。' },
+      headers: { type: 'object', additionalProperties: true, description: '可选额外请求头，仅对直链下载生效。' },
     },
     output: OUTPUT,
     async execute(args, exec) {
@@ -789,19 +998,29 @@ export function apply(ctx) {
         else exec.signal.addEventListener('abort', onOuterAbort, { once: true })
       }
       try {
-        if (isResolvablePage(url)) {
+        const route = routeFor(url)
+        if (route === 'bilibili') {
           const info = await downloadBilibili(url, {
             outPath: args.outPath,
             quality: args.quality || 'best',
             signal: controller.signal,
           })
+          return JSON.stringify({ backend: 'bilibili', ...info, elapsedMs: Date.now() - started })
+        }
+        if (route === 'unsupported') {
+          return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
+        }
+        if (route === 'ytdlp') {
+          const info = await downloadWithYtDlp(url, {
+            outPath: args.outPath,
+            cookies: args.cookies,
+            quality: args.quality || 'best',
+            signal: controller.signal,
+          })
           return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
         }
-        if (detectSite(url) === 'bilibili' && !isMedia(url)) {
-          return JSON.stringify({
-            error: 'unsupported',
-            message: '这是 B站 链接，但不是视频页（可能是专栏/直播/空间）。请给 /video/BV... 形式的视频链接。',
-          })
+        if (route === 'none') {
+          return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
         }
         const { filePath, bytes, ext } = await downloadMedia(url, {
           outPath: args.outPath,
@@ -809,6 +1028,7 @@ export function apply(ctx) {
           signal: controller.signal,
         })
         return JSON.stringify({
+          backend: 'direct',
           savedTo: filePath,
           bytes,
           quality: getQuality(url),
@@ -817,7 +1037,7 @@ export function apply(ctx) {
         })
       } catch (err) {
         return JSON.stringify({
-          error: 'download_failed',
+          error: err?.code || 'download_failed',
           message: err?.message || String(err),
           elapsedMs: Date.now() - started,
         })

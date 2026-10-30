@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   apply,
   analyze,
+  classifyYtDlpError,
   detectSite,
   extractBvid,
   extractPage,
@@ -12,6 +13,7 @@ import {
   isResolvablePage,
   pickAudioTrack,
   pickVideoTrack,
+  routeFor,
   sanitizeName,
 } from '../src/index.js'
 
@@ -78,10 +80,38 @@ test('isResolvablePage separates page links from direct media links', () => {
   assert.equal(isResolvablePage('https://example.com/video.mp4'), false)
 })
 
-test('analyze distinguishes page / direct / unknown', () => {
-  assert.equal(analyze('https://www.bilibili.com/video/BV1GJ411x7h7').kind, 'page')
+test('analyze distinguishes page / direct / unknown and exposes the backend', () => {
+  const page = analyze('https://www.bilibili.com/video/BV1GJ411x7h7')
+  assert.equal(page.kind, 'page')
+  assert.equal(page.backend, 'bilibili')
+  const other = analyze('https://example.com/watch/12345')
+  assert.equal(other.kind, 'page')
+  assert.equal(other.backend, 'ytdlp')
   assert.equal(analyze('https://example.com/a.mp4').kind, 'direct')
-  assert.equal(analyze('https://example.com/page').kind, 'unknown')
+  assert.equal(analyze('https://example.com/a.mp4').backend, 'direct')
+  assert.equal(analyze('not a url').kind, 'unknown')
+  assert.equal(analyze('https://www.bilibili.com/read/cv123').backend, 'unsupported')
+})
+
+test('routeFor picks one engine per input', () => {
+  assert.equal(routeFor('BV1GJ411x7h7'), 'bilibili')
+  assert.equal(routeFor('https://b23.tv/abcdefg'), 'bilibili')
+  assert.equal(routeFor('https://example.com/a.mp4'), 'direct')
+  assert.equal(routeFor('https://www.douyin.com/video/123'), 'ytdlp')
+  assert.equal(routeFor('https://www.youtube.com/watch?v=BaW_jenozKc'), 'ytdlp')
+  assert.equal(routeFor('https://www.bilibili.com/read/cv123'), 'unsupported')
+  assert.equal(routeFor('nothing here'), 'none')
+})
+
+test('classifyYtDlpError maps stderr onto stable error codes', () => {
+  assert.equal(classifyYtDlpError('ERROR: Unsupported URL: https://x.y/z'), 'unsupported')
+  assert.equal(classifyYtDlpError('ERROR: Sign in to confirm you are not a bot'), 'need_login')
+  assert.equal(classifyYtDlpError('ERROR: [youtube] x: This video is unavailable'), 'unavailable')
+  assert.equal(classifyYtDlpError('ERROR: HTTP Error 403: Forbidden'), 'blocked')
+  assert.equal(classifyYtDlpError('ERROR: [generic] page: HTTP Error 404: Not Found'), 'not_found')
+  assert.equal(classifyYtDlpError('ERROR: ffmpeg not found. Please install or provide the path'), 'missing_ffmpeg')
+  assert.equal(classifyYtDlpError('ERROR: Unable to download webpage: timed out'), 'network')
+  assert.equal(classifyYtDlpError('something odd'), 'download_failed')
 })
 
 test('pickVideoTrack prefers the highest id and an avc codec', () => {
