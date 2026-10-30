@@ -12,8 +12,11 @@
  *     video_download       direct media URL or a Bilibili page URL -> file(s) on disk
  *     video_quality_parse  pure regex quality/extension extraction
  *
- * `@deepseek-ai/dsh-tools` is a peer dependency: the host runtime provides it,
- * so the plugin never bundles a second copy of the kernel tool library.
+ * The plugin depends on no kernel package at import time: profile bundles are
+ * resolved outside the host's kernel package tree, so `@deepseek-ai/dsh-tools`
+ * is not importable from here (shipped plugins never import it either). The
+ * declarative parameter DSL is therefore compiled locally into plain JSON
+ * Schema, which is exactly what `ctx.tools.register()` consumes.
  */
 
 import { createWriteStream, mkdirSync } from 'node:fs'
@@ -22,7 +25,6 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { Readable } from 'node:stream'
 import { homedir } from 'node:os'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'dsh-video-downloader'
 export const inject = ['tools']
@@ -35,6 +37,56 @@ const BROWSER_UA =
 const BILI_REFERER = 'https://www.bilibili.com/'
 const MAX_REDIRECTS = 5
 const IDLE_TIMEOUT_MS = 60_000
+
+// ------------------------------------------------------------ tool helper
+// Local stand-in for `defineTool` from @deepseek-ai/dsh-tools: same declarative
+// parameter DSL in, plain JSON Schema out. `ctx.tools.register()` only needs
+// { name, description, parameters, output, execute } and validates the output
+// schema itself, so no kernel module has to be resolvable at import time.
+
+const SPEC_KEYS = ['type', 'title', 'description', 'default', 'examples', 'enum']
+
+function compileNode(node) {
+  if (node === null || typeof node !== 'object') return { type: 'string' }
+  const out = {}
+  for (const key of SPEC_KEYS) if (node[key] !== undefined) out[key] = node[key]
+  if (node.type === 'object') {
+    const properties = {}
+    const required = []
+    for (const [key, value] of Object.entries(node.properties ?? {})) {
+      properties[key] = compileNode(value)
+      if (value?.required === true) required.push(key)
+    }
+    out.type = 'object'
+    if (Object.keys(properties).length > 0) out.properties = properties
+    if (required.length > 0) out.required = required
+    if (typeof node.additionalProperties === 'boolean') out.additionalProperties = node.additionalProperties
+  } else if (node.type === 'array') {
+    out.type = 'array'
+    out.items = compileNode(node.items ?? { type: 'string' })
+  } else {
+    out.type = node.type ?? 'string'
+  }
+  return out
+}
+
+function compileParameters(spec) {
+  return compileNode({ type: 'object', properties: spec ?? {} })
+}
+
+function defineTool(options) {
+  const definition = {
+    name: options.name,
+    description: options.description,
+    parameters: compileParameters(options.parameters),
+    output: options.output,
+    async execute(args, exec) {
+      return options.execute(args ?? {}, exec)
+    },
+  }
+  if (options.timeoutMs !== undefined) definition.timeoutMs = options.timeoutMs
+  return definition
+}
 
 // Media heuristics lifted from video-downloader-extension/background.js.
 const MEDIA_EXT = /\.(mp4|m3u8|flv|webm|mkv|avi|mov|ts|f4v|mpd|m4s|mp3|wav|aac|ogg|opus|flac)(\?[^]*)?$/i

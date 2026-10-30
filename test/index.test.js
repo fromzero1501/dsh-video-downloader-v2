@@ -112,15 +112,27 @@ test('sanitizeName strips filesystem-hostile characters and caps length', () => 
   assert.ok(sanitizeName('x'.repeat(200)).length <= 80)
 })
 
-test('apply registers the four tools with valid schemas', () => {
+test('apply registers the four tools with valid JSON-Schema parameters', () => {
   const ctx = mockCtx()
   apply(ctx)
   const names = ctx.all.map((t) => t.name).sort()
   assert.deepEqual(names, ['video_analyze', 'video_download', 'video_quality_parse', 'video_resolve'])
   for (const t of ctx.all) {
     assert.equal(typeof t.description, 'string')
-    assert.deepEqual(Object.keys(t.parameters ?? {}), Object.keys(t.parameters ?? {}))
+    assert.equal(t.parameters.type, 'object')
+    assert.deepEqual(t.parameters.required, ['url'])
+    assert.equal(t.parameters.properties.url.type, 'string')
+    assert.equal(t.parameters.additionalProperties, undefined)
+    assert.equal(t.output.schema.type, 'string')
+    assert.equal(typeof t.output.render, 'function')
   }
+  const download = ctx.get('video_download')
+  assert.equal(download.parameters.properties.headers.type, 'object')
+  assert.equal(download.parameters.properties.headers.additionalProperties, true)
+  assert.deepEqual(
+    download.output.render({}, 'hello'),
+    [{ type: 'text', text: 'hello' }],
+  )
 })
 
 test('video_quality_parse returns { quality: "720P", ext: "mp4" } for a sample URL', async () => {

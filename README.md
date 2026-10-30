@@ -80,7 +80,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 
 - DSH：`>=0.2.0-rc.2 <0.3.0`（`engines.dsh`，启动时由 `dsh-app-boot` 校验）
 - Node：`>=20`
-- 依赖：只用 `@deepseek-ai/dsh-tools` 的 `defineTool` 与 `ctx.tools.register`，从宿主解析，不额外安装内核副本
+- 依赖：运行时不 import 任何内核包（`ctx.tools.register()` 只需要普通 JSON Schema），参数 DSL 由插件自己编译，因此不会装出第二份 `dsh-tools`
 
 ## 测试
 
