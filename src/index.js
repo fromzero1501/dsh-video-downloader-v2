@@ -171,6 +171,8 @@ export function getExt(url, ct) {
 
 /** Which supported site a URL belongs to (by hostname). */
 export function detectSite(url) {
+  // 抖音的分享短链经常连分享文案一起粘进来，整段不是合法 URL，先按文本认出来
+  if (/v\.douyin\.com\/[A-Za-z0-9_-]+/i.test(String(url ?? ''))) return 'douyin'
   let hostname = ''
   try {
     hostname = new URL(url).hostname
@@ -228,6 +230,56 @@ export function normalizeDouyinUrl(input) {
   return id ? `https://www.douyin.com/video/${id}` : s
 }
 
+/** The `v.douyin.com/<code>` short link hidden inside a share sentence (empty when absent). */
+export function douyinShortLink(input) {
+  const m = String(input ?? '').match(/(?:https?:\/\/)?(v\.douyin\.com\/[A-Za-z0-9_-]+)/i)
+  return m ? `https://${m[1]}/` : ''
+}
+
+/**
+ * Turn any Douyin input into a canonical page URL. A nineteen-digit id is used as
+ * is; a `v.douyin.com` short link is followed once over plain HTTP (it is only two
+ * 302s, no browser involved) so the caller always navigates a `/video/<id>` page.
+ * Returns null when the input carries no Douyin id and no short link.
+ */
+export async function resolveDouyinInput(input, { signal, timeoutMs = 8000 } = {}) {
+  const s = String(input ?? '').trim()
+  const direct = douyinVideoId(s)
+  if (direct) return { id: direct, pageUrl: `https://www.douyin.com/video/${direct}`, via: 'id' }
+
+  const short = douyinShortLink(s)
+  if (!short) return null
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('短链解析超时')), timeoutMs)
+  if (typeof timer.unref === 'function') timer.unref()
+  const onAbort = () => controller.abort(signal?.reason)
+  if (signal) signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    const res = await fetch(short, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
+    })
+    const finalUrl = String(res.url || '')
+    try {
+      await res.body?.cancel()
+    } catch {
+      // 只要跳转后的地址，正文丢掉
+    }
+    const id = douyinVideoId(finalUrl)
+    if (!id) {
+      const err = new Error('抖音短链没有跳到视频页（可能已失效，或被风控拦下）')
+      err.code = 'unavailable'
+      throw err
+    }
+    return { id, pageUrl: `https://www.douyin.com/video/${id}`, via: 'short-link' }
+  } finally {
+    clearTimeout(timer)
+    if (signal) signal.removeEventListener('abort', onAbort)
+  }
+}
+
 /** A playlist URL is not a file: streaming it would only save the playlist text. */
 export function isPlaylistUrl(url) {
   const ext = getExt(url)
@@ -253,13 +305,27 @@ export function isResolvablePage(input) {
   }
 }
 
+/**
+ * True when only the Douyin path can handle this input: a Douyin page, a
+ * `v.douyin.com` short link, a whole share sentence, or a bare nineteen-digit id.
+ */
+export function isDouyinSource(input) {
+  const s = String(input ?? '').trim()
+  if (!s) return false
+  if (/^\d{19}$/.test(s)) return true
+  return detectSite(s) === 'douyin'
+}
+
 /** Which engine should handle this input: bilibili | direct | ytdlp | unsupported | none. */
 export function routeFor(input) {
   const raw = String(input ?? '').trim()
   if (!raw) return 'none'
   const s = normalizeDouyinUrl(raw)
   if (isResolvablePage(s)) return 'bilibili'
+  // 直链优先：抖音 CDN 的 .mp4 也带 douyin.com 域名，不能当页面处理
   if (isMedia(s)) return isPlaylistUrl(s) ? 'ytdlp' : 'direct'
+  // 抖音短链与分享文本本身不是合法 URL，先认出来，别落到 unsupported/none
+  if (isDouyinSource(raw)) return 'ytdlp'
   if (!/^https?:\/\//i.test(s)) return 'none'
   if (detectSite(s) === 'bilibili') return 'unsupported'
   return 'ytdlp'
@@ -860,7 +926,7 @@ function ytdlpArgs(url, { cookies } = {}) {
   // Douyin rejects requests that arrive through a desktop system proxy with
   // `Blocked by ArgusSecurityPlugin`; ask for a direct connection there unless
   // the caller pinned a proxy explicitly.
-  else if (detectSite(url) === 'douyin') args.push('--proxy', '')
+  else if (isDouyinSource(url)) args.push('--proxy', '')
   if (cookies) args.push('--cookies', cookies)
   args.push(url)
   return args
@@ -1133,7 +1199,7 @@ function openCdp(wsUrl) {
           const payload = { id, method, params }
           if (sessionId) payload.sessionId = sessionId
           return new Promise((res, rej) => {
-            pending.set(id, { res, rej })
+            pending.set(id, { resolve: res, reject: rej })
             ws.send(JSON.stringify(payload))
           })
         },
@@ -1157,7 +1223,7 @@ function openCdp(wsUrl) {
       const item = pending.get(msg.id)
       pending.delete(msg.id)
       if (msg.error) item.reject(new Error(msg.error.message || 'CDP 调用失败'))
-      else item.res(msg.result)
+      else item.resolve(msg.result)
     })
     ws.addEventListener('error', () => abortAll(new Error('CDP 连接失败')))
     ws.addEventListener('close', () => abortAll(new Error('CDP 连接已关闭')))
@@ -1280,7 +1346,8 @@ function releaseBrowser(idleMs = WARM_IDLE_MS) {
  * plugin's own storage.
  */
 export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_000 } = {}) {
-  const pageUrl = normalizeDouyinUrl(input)
+  const target = await resolveDouyinInput(input, { signal })
+  const pageUrl = target?.pageUrl || normalizeDouyinUrl(input)
   const bin = findBrowser()
   if (!bin) {
     const err = new Error('本机没有找到 Edge/Chrome，抖音这条通路需要浏览器；可用 DSH_BROWSER_PATH 指定路径。')
@@ -1383,6 +1450,7 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
       }
       return {
         backend: 'douyin-browser',
+        id: target?.id || douyinVideoId(input),
         pageUrl,
         mediaUrl,
         title,
@@ -1432,7 +1500,7 @@ function probeVideoDims(filePath) {
 
 export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
   const resolved = await resolveDouyinWithBrowser(input, { signal })
-  const id = douyinVideoId(input)
+  const id = resolved.id || douyinVideoId(input)
   const stem = sanitizeName(resolved.title || id || 'douyin')
   const outDir = outDirOf(outPath)
   const target = outDir
@@ -1505,7 +1573,7 @@ export function apply(ctx) {
           return JSON.stringify(info, null, 2)
         }
         if (routeFor(url) === 'ytdlp') {
-          if (detectSite(url) === 'douyin') {
+          if (isDouyinSource(url)) {
             try {
               const page = await resolveDouyinWithBrowser(url, { signal: exec?.signal })
               return JSON.stringify(
@@ -1578,7 +1646,7 @@ export function apply(ctx) {
           return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
         }
         if (route === 'ytdlp') {
-          if (detectSite(url) === 'douyin') {
+          if (isDouyinSource(url)) {
             try {
               const info = await downloadDouyin(url, { outPath: args.outPath, signal: controller.signal })
               return JSON.stringify({ ...info, elapsedMs: Date.now() - started })

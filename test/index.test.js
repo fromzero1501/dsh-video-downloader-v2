@@ -16,7 +16,9 @@ import {
   isMedia,
   isPlaylistUrl,
   isResolvablePage,
+  douyinShortLink,
   normalizeDouyinUrl,
+  resolveDouyinInput,
   outDirOf,
   pickAudioTrack,
   pickVideoTrack,
@@ -256,4 +258,21 @@ test('outDirOf: only directory-shaped outPath counts as a directory', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('a share sentence with a v.douyin.com short link still counts as Douyin', () => {
+  const share =
+    '5.15 复制打开抖音，看看【香香在新疆的作品】红枣大丰收 https://v.douyin.com/bvWiDnyQSXI/ p@D.Uy Gvf:/ :4pm 08/07'
+  assert.equal(detectSite(share), 'douyin')
+  assert.equal(douyinShortLink(share), 'https://v.douyin.com/bvWiDnyQSXI/')
+  assert.equal(douyinShortLink('https://v.douyin.com/abcDEF12/'), 'https://v.douyin.com/abcDEF12/')
+  assert.equal(douyinShortLink('https://www.douyin.com/video/7700634421217620730'), '')
+})
+
+test('resolveDouyinInput answers a canonical page for a bare id and passes others through', async () => {
+  const byId = await resolveDouyinInput('7700634421217620730')
+  assert.equal(byId.id, '7700634421217620730')
+  assert.equal(byId.pageUrl, 'https://www.douyin.com/video/7700634421217620730')
+  assert.equal(byId.via, 'id')
+  assert.equal(await resolveDouyinInput('https://example.com/clip.mp4'), null)
 })
