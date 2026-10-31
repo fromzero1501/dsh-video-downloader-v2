@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import {
   apply,
   analyze,
@@ -14,6 +17,7 @@ import {
   isPlaylistUrl,
   isResolvablePage,
   normalizeDouyinUrl,
+  outDirOf,
   pickAudioTrack,
   pickVideoTrack,
   routeFor,
@@ -235,4 +239,21 @@ test('routeFor sends playlists to the merging backend instead of raw streaming',
 test('classifyYtDlpError treats the Argus rejection as blocked', () => {
   assert.equal(classifyYtDlpError('Blocked by ArgusSecurityPlugin Uifid Not Found'), 'blocked')
   assert.equal(classifyYtDlpError('HTTP Error 403: Forbidden'), 'blocked')
+})
+
+
+test('outDirOf: only directory-shaped outPath counts as a directory', () => {
+  assert.equal(outDirOf(undefined), null)
+  assert.equal(outDirOf(''), null)
+  assert.equal(outDirOf('   '), null)
+  assert.equal(outDirOf('C:\\no\\such\\clip.mp4'), null)
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-outdir-'))
+  try {
+    assert.equal(outDirOf(dir), resolve(dir))
+    assert.equal(outDirOf(dir + '/'), resolve(dir))
+    assert.equal(outDirOf(dir + '\\'), resolve(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

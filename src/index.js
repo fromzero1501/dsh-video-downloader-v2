@@ -421,7 +421,22 @@ export function defaultDownloadDir() {
   return join(homedir(), 'Downloads', 'dsh-video-downloader')
 }
 
+/**
+ * outPath 指的是「一个目录」而不是文件名时返回该目录，否则返回 null。
+ * 判定：末尾带路径分隔符，或者本来就是一个存在的目录。这样传目录就能让插件自己用标题命名。
+ */
+export function outDirOf(outPath) {
+  if (!outPath) return null
+  const raw = String(outPath).trim()
+  if (!raw) return null
+  const looksLikeDir = /[\\/]$/.test(raw) || (existsSync(raw) && statSync(raw).isDirectory())
+  if (!looksLikeDir) return null
+  return isAbsolute(raw) ? resolve(raw) : resolve(defaultDownloadDir(), raw)
+}
+
 function resolveOutPath(url, ext, outPath) {
+  const outDir = outDirOf(outPath)
+  if (outDir) return join(outDir, defaultFileName(url, ext))
   if (outPath && isAbsolute(outPath)) return outPath
   if (outPath) return resolve(defaultDownloadDir(), outPath)
   return join(defaultDownloadDir(), defaultFileName(url, ext))
@@ -711,12 +726,15 @@ function muxTracks(ffmpeg, videoPath, audioPath, outPath, signal) {
  */
 export async function downloadBilibili(input, { outPath, signal, quality = 'best', idleMs } = {}) {
   const info = await resolveBilibili(input, { signal, quality })
-  const dir = outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir()
+  const outDir = outDirOf(outPath)
+  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir())
   mkdirSync(dir, { recursive: true })
 
-  const base = outPath && isAbsolute(outPath)
-    ? outPath.replace(/\.[a-z0-9]+$/i, '')
-    : join(dir, `${sanitizeName(info.title || info.bvid)}_${info.bvid}${info.page > 1 ? `_p${info.page}` : ''}`)
+  const base = outDir
+    ? join(outDir, `${sanitizeName(info.title || info.bvid)}_${info.bvid}${info.page > 1 ? `_p${info.page}` : ''}`)
+    : outPath && isAbsolute(outPath)
+      ? outPath.replace(/\.[a-z0-9]+$/i, '')
+      : join(dir, `${sanitizeName(info.title || info.bvid)}_${info.bvid}${info.page > 1 ? `_p${info.page}` : ''}`)
 
   const headers = { 'User-Agent': BROWSER_UA, Referer: `https://www.bilibili.com/video/${info.bvid}` }
   const videoTmp = `${base}.video.m4s`
@@ -926,11 +944,14 @@ export async function downloadWithYtDlp(input, { outPath, cookies, signal, quali
     err.code = 'backend_missing'
     throw err
   }
-  const dir = outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir()
+  const outDir = outDirOf(outPath)
+  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir())
   mkdirSync(dir, { recursive: true })
-  const template = outPath && isAbsolute(outPath)
-    ? `${outPath.replace(/\.[a-z0-9]{1,5}$/i, '')}.%(ext)s`
-    : join(dir, '%(title).80s [%(id)s].%(ext)s')
+  const template = outDir
+    ? join(outDir, '%(title).80s [%(id)s].%(ext)s')
+    : outPath && isAbsolute(outPath)
+      ? `${outPath.replace(/\.[a-z0-9]{1,5}$/i, '')}.%(ext)s`
+      : join(dir, '%(title).80s [%(id)s].%(ext)s')
 
   const args = [
     ...ytdlpArgs(input, { cookies }),
@@ -1023,6 +1044,15 @@ const DOUYIN_DIM_EXPR = [
   "  const v = document.querySelector('video')",
   '  if (!v) return { width: 0, height: 0 }',
   '  return { width: v.videoWidth || 0, height: v.videoHeight || 0 }',
+  '})()',
+].join('\n')
+
+const DOUYIN_KICK_EXPR = [
+  '(() => {',
+  "  const v = document.querySelector('video')",
+  '  if (!v) return false',
+  '  try { v.muted = true; v.play() } catch (e) {}',
+  "  return (v.currentSrc || '').slice(0, 16)",
   '})()',
 ].join('\n')
 
@@ -1197,6 +1227,7 @@ function launchBrowser(bin, profileDir) {
         '--disable-gpu',
         '--mute-audio',
         '--disable-blink-features=AutomationControlled',
+        '--autoplay-policy=no-user-gesture-required',
         'about:blank',
       ],
       { stdio: 'ignore', windowsHide: true },
@@ -1290,8 +1321,17 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
       const sizes = new Map()
       const startedAt = Date.now()
       const deadline = startedAt + timeoutMs
+      const kickAt = startedAt + 1200
+      let kicked = false
+      let kickedForPreview = false
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error('执行已取消')
+        // 有些页面不主动起播就不去取真实码流（只挂着一份 2.6 秒的试看片），敲一下 play()
+        if (!kicked && Date.now() >= kickAt) {
+          kicked = true
+          const cur = await evalIn(call, DOUYIN_KICK_EXPR)
+          if (typeof cur === 'string' && cur) kickedForPreview = true
+        }
         const probe = await evalIn(call, DOUYIN_SRC_EXPR)
         if (probe && typeof probe === 'object') {
           title = String(probe.title || '') || title
@@ -1319,10 +1359,14 @@ export async function resolveDouyinWithBrowser(input, { signal, timeoutMs = 30_0
               contentBytes = size
             }
           }
-          // 页面偶尔先给一条几秒钟的试看流：标题都还没出来、体积又很小时先别急
+          // 页面偶尔先给一条几秒钟的试看流：再敲一次 play() 逼它换到完整码流
+          if (!kickedForPreview && contentBytes && contentBytes < PREVIEW_BYTES) {
+            kickedForPreview = true
+            await evalIn(call, DOUYIN_KICK_EXPR)
+          }
           const settled = (title && (!contentBytes || contentBytes >= PREVIEW_BYTES)) || candidates.length > 1
           if (settled) break
-          if (Date.now() - startedAt > 10_000) break
+          if (Date.now() - startedAt > 15_000) break
         }
         await delay(150)
       }
@@ -1390,8 +1434,10 @@ export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
   const resolved = await resolveDouyinWithBrowser(input, { signal })
   const id = douyinVideoId(input)
   const stem = sanitizeName(resolved.title || id || 'douyin')
-  const target =
-    outPath && isAbsolute(outPath)
+  const outDir = outDirOf(outPath)
+  const target = outDir
+    ? join(outDir, `${stem}${id ? `_${id}` : ''}.mp4`)
+    : outPath && isAbsolute(outPath)
       ? `${outPath.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp4`
       : join(defaultDownloadDir(), `${stem}${id ? `_${id}` : ''}.mp4`)
   const { filePath, bytes } = await downloadMedia(resolved.mediaUrl, {
@@ -1503,7 +1549,7 @@ export function apply(ctx) {
       '默认目录：$DSH_VIDEO_DOWNLOAD_DIR，未设置时为用户 Downloads/dsh-video-downloader。',
     parameters: {
       url: { type: 'string', required: true, description: '媒体直链、B站 视频页链接，或其他站点的视频页面链接。' },
-      outPath: { type: 'string', description: '可选保存路径；绝对路径按原样使用，相对路径相对默认下载目录。' },
+      outPath: { type: 'string', description: '可选保存路径；传目录（已存在的目录，或以 / \\ 结尾）时按视频标题自动命名并放进该目录，传文件名则按该名保存；相对路径相对默认下载目录。' },
       quality: { type: 'string', description: '清晰度偏好：best（默认）/ worst / 数字质量 id。' },
       cookies: { type: 'string', description: '可选：cookies.txt 的绝对路径，用于需要登录态的内容（B站 以外站点）。' },
       headers: { type: 'object', additionalProperties: true, description: '可选额外请求头，仅对直链下载生效。' },

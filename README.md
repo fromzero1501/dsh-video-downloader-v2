@@ -36,6 +36,8 @@ video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\
 2. 环境变量 `DSH_VIDEO_DOWNLOAD_DIR`
 3. 默认 `~/Downloads/dsh-video-downloader/`
 
+`outPath` 传**目录**（已存在的目录，或以 `/`、`\` 结尾）时，按视频标题自动命名并**直接写进该目录**，不再先落默认目录再搬；传文件名时按该名保存（扩展名自动补 `.mp4`）。
+
 文件名取自视频标题（B 站额外带 BV 号），已过滤 Windows 非法字符并限长。
 
 ## 外部依赖
