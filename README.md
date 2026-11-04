@@ -90,7 +90,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 ## 支持范围
 
-- **B 站**：BV 号、标准页面链接、`b23.tv` 短链、多 P（`?p=`）。走内置解析，匿名最高 480P；1080P 及以上要登录态，本版本不带账号态。
+- **B 站**：BV 号、标准页面链接、`b23.tv` 短链、多 P（`?p=`）。走内置解析；能读到 B 站登录凭证时清晰度上限等于账号权限（大会员可到 1080P+ / 4K / 8K），读不到就退回匿名（最高 480P）。凭证文件按 `DSH_BILI_CREDENTIAL` → `%APPDATA%\dsh-desktop\harness\bili-duty\bili_credential.json` → `$DSH_HOME` / `~/.dsh` 下的 `bili_credential.json` 顺序找，支持 `sessdata` / `bili_jct` / `buvid3` / `dedeuserid` 字段（值可以是 URL 编码）；凭证过期或文件损坏自动退回匿名，不会把请求弄挂。
 - **抖音**：`/video/<id>`、个人页 `?modal_id=<id>`、`v.douyin.com/<码>` 短链、整段分享文本（含短链）、裸的 19 位 id 都认；走本地浏览器通路，默认不需要 Cookie、不需要登录，公开作品即可下。直播、会员、私密作品不处理。
 - **直链媒体**：mp4 / m4s / webm / mkv / flv / ts 按扩展名与 Content-Type 判定，原生下载；m3u8 / mpd 是播放列表不是媒体本身，交给 yt-dlp 拉流合并，不再当成视频文件直接存盘。
 - **其他站点**：交给 yt-dlp，覆盖其支持的全部站点（小红书、YouTube、快手、Vimeo 等）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。

@@ -20,7 +20,7 @@
  */
 
 import { createWriteStream, mkdirSync, mkdtempSync, statSync } from 'node:fs'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { renameSync, unlinkSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
@@ -608,23 +608,149 @@ export async function downloadMedia(url, { outPath, headers = {}, signal, idleMs
 
 // ------------------------------------------------------------ bilibili I/O
 
-let cookieJar = ''
+let anonJar = ''
 
-/** One-off cookie bootstrap: B站 接口对没有 buvid3 的请求直接 412。 */
-async function bilibiliCookie(signal) {
-  if (cookieJar) return cookieJar
+/**
+ * 登录态 Cookie 的有效期缓存。凭证文件可能晚于进程出现（用户中途扫码登录），
+ * 所以不永久缓存：过期后重读一次文件并重新探测登录态。
+ */
+const BILI_AUTH_TTL_MS = 60_000
+let authMemo = { at: 0, cookie: '', loggedIn: false }
+
+/** 凭证文件候选位置：显式环境变量优先，其次本机 B站 插件的家目录。 */
+function biliCredentialPaths() {
+  const out = []
+  const explicit = (process.env.DSH_BILI_CREDENTIAL || '').trim()
+  if (explicit) out.push(explicit)
+  const appData = (process.env.APPDATA || '').trim()
+  if (appData) out.push(join(appData, 'dsh-desktop', 'harness', 'bili-duty', 'bili_credential.json'))
+  const dshHome = (process.env.DSH_HOME || '').trim()
+  if (dshHome) {
+    out.push(join(dshHome, 'bili-duty', 'bili_credential.json'))
+    out.push(join(dshHome, 'bili_credential.json'))
+  }
+  const home = homedir()
+  if (home) {
+    out.push(join(home, '.dsh', 'bili-duty', 'bili_credential.json'))
+    out.push(join(home, '.dsh', 'bili_credential.json'))
+  }
+  return [...new Set(out)]
+}
+
+/** Cookie 值可能是 URL 编码存的（SESSDATA 里的 %2C），解一次；解坏了就原样用。 */
+function decodeCookieValue(value) {
+  if (!/%[0-9a-fA-F]{2}/.test(value)) return value
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+/**
+ * 读登录凭证：字段名大小写不统一，逐个候选键取；缺 SESSDATA 就当作没有凭证。
+ * 读不到或文件损坏一律返回 null（退回匿名），不抛错。
+ */
+function loadBiliCredential() {
+  for (const file of biliCredentialPaths()) {
+    try {
+      if (!existsSync(file)) continue
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      if (!parsed || typeof parsed !== 'object') continue
+      const pick = (...keys) => {
+        for (const key of keys) {
+          const raw = parsed[key]
+          if (typeof raw === 'string' && raw.trim()) return decodeCookieValue(raw.trim())
+          if (typeof raw === 'number') return String(raw)
+        }
+        return ''
+      }
+      const sessdata = pick('sessdata', 'SESSDATA', 'sessData')
+      if (!sessdata) continue
+      const cookie = new Map()
+      cookie.set('SESSDATA', sessdata)
+      const jct = pick('bili_jct', 'biliJct', 'BILI_JCT')
+      if (jct) cookie.set('bili_jct', jct)
+      const buvid3 = pick('buvid3', 'buvid', 'BUVID3')
+      if (buvid3) cookie.set('buvid3', buvid3)
+      const uid = pick('dedeuserid', 'DedeUserID', 'dedeUserID', 'uid', 'mid')
+      if (uid) cookie.set('DedeUserID', uid)
+      return cookie
+    } catch {
+      // 坏文件按「没有凭证」处理，继续找下一个候选路径
+    }
+  }
+  return null
+}
+
+/** 匿名 Cookie：B站 接口对没有 buvid3 的请求直接 412，先抓一份首页 Set-Cookie。 */
+async function anonymousBiliCookie(signal) {
+  if (anonJar) return anonJar
   const res = await fetch('https://www.bilibili.com/', {
     headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
     signal,
   })
   const raw = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []
-  cookieJar = raw.map((c) => String(c).split(';')[0]).filter(Boolean).join('; ')
+  anonJar = raw
+    .map((c) => String(c).split(';')[0])
+    .filter(Boolean)
+    .join('; ')
   try {
     await res.arrayBuffer()
   } catch {
     // body irrelevant
   }
-  return cookieJar
+  return anonJar
+}
+
+/** 这份 Cookie 到底算不算登录态：nav 接口的 isLogin 是唯一可信判据。 */
+async function bilibiliLoginProbe(cookie, signal) {
+  try {
+    const res = await fetch('https://api.bilibili.com/x/web-interface/nav', {
+      headers: {
+        'User-Agent': BROWSER_UA,
+        Referer: BILI_REFERER,
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        Cookie: cookie,
+      },
+      signal,
+    })
+    const j = await res.json()
+    return j?.data?.isLogin === true
+  } catch {
+    return false
+  }
+}
+
+function mergeCookie(anon, extra) {
+  const jar = new Map()
+  for (const part of String(anon || '').split('; ')) {
+    const eq = part.indexOf('=')
+    if (eq > 0) jar.set(part.slice(0, eq), part.slice(eq + 1))
+  }
+  if (extra) for (const [key, value] of extra) jar.set(key, value)
+  return [...jar].map(([key, value]) => `${key}=${value}`).join('; ')
+}
+
+/**
+ * 请求用 Cookie：匿名 buvid3 打底，能读到登录凭证就叠加上去（凭证覆盖同名项）。
+ * 有凭证时用 nav 探一次登录态，探不通就退回匿名，绝不因为凭证过期把请求弄挂。
+ */
+async function bilibiliCookie(signal) {
+  if (Date.now() - authMemo.at < BILI_AUTH_TTL_MS) return authMemo.cookie
+  const anon = await anonymousBiliCookie(signal)
+  const credential = loadBiliCredential()
+  if (credential) {
+    const merged = mergeCookie(anon, credential)
+    if (await bilibiliLoginProbe(merged, signal)) {
+      authMemo = { at: Date.now(), cookie: merged, loggedIn: true }
+      return merged
+    }
+  }
+  const cookie = mergeCookie(anon, null)
+  authMemo = { at: Date.now(), cookie, loggedIn: false }
+  return cookie
 }
 
 async function bilibiliJson(url, signal) {
@@ -672,8 +798,9 @@ async function expandShortLink(input, signal) {
 
 /**
  * Resolve a Bilibili video (BV id / page URL / short link) into concrete
- * DASH streams. Anonymous only: what the site grants without login (usually
- * up to 480P), never touches cookies of a logged-in account.
+ * DASH streams. 请求带上登录凭证（能读到就用），所以清晰度上限跟着账号权限走：
+ * 大会员账号可到 1080P+/4K/8K；没有凭证或凭证过期则退回匿名，最高 480P。
+ * qn 固定按最高档请求，站点自己夹到「该账号能拿到的最高档」。
  */
 export async function resolveBilibili(input, { signal, quality = 'best' } = {}) {
   const expanded = await expandShortLink(input, signal)
@@ -722,6 +849,7 @@ export async function resolveBilibili(input, { signal, quality = 'best' } = {}) 
     pageTitle: pageInfo.part || '',
     title: view.title || '',
     durationSec: view.duration || 0,
+    loggedIn: authMemo.loggedIn === true,
     qualities,
     video: {
       qualityId: video.id,
@@ -743,7 +871,7 @@ export async function resolveBilibili(input, { signal, quality = 'best' } = {}) 
       : null,
     requiresMux: Boolean(audio),
     expiresAt: deadline ? deadline * 1000 : 0,
-    note: 'URL 有时效（约 2 小时），过期重新解析即可；匿名最高清晰度受站点限制。',
+    note: 'URL 有时效（约 2 小时），过期重新解析即可；清晰度上限等于账号权限，未登录时站点只给到 480P。',
   }
 }
 
@@ -827,6 +955,7 @@ export async function downloadBilibili(input, { outPath, signal, quality = 'best
       audioBytes,
       muxed: true,
       quality: info.video.qualityLabel,
+      loggedIn: info.loggedIn === true,
       title: info.title,
       bvid: info.bvid,
       page: info.page,
@@ -849,6 +978,7 @@ export async function downloadBilibili(input, { outPath, signal, quality = 'best
       muxed: false,
       needsMux: true,
       quality: info.video.qualityLabel,
+      loggedIn: info.loggedIn === true,
       title: info.title,
       bvid: info.bvid,
       page: info.page,
@@ -861,6 +991,7 @@ export async function downloadBilibili(input, { outPath, signal, quality = 'best
     bytes: videoBytes,
     muxed: true,
     quality: info.video.qualityLabel,
+    loggedIn: info.loggedIn === true,
     title: info.title,
     bvid: info.bvid,
     page: info.page,
