@@ -88,6 +88,24 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 试看流防护按「页面标题是否已出 + 体积是否过 800 KB」判断，宁可多等几百毫秒，也不会把几秒钟的片段当成成品。
 
+## 设置页
+
+**设置 → 插件 → dsh-video-downloader** 由 DSH 按插件的 `Config` 自动生成表单，无需重启，改完下一条命令就生效。留空 = 没设（退回下一层），所以清空设置页不会让插件失效。
+
+| 设置项 | 默认 | 说明 |
+| --- | --- | --- |
+| 默认下载目录 | 空 | 空 = 系统 `Downloads\dsh-video-downloader`；目录不存在会自动创建 |
+| 默认清晰度偏好 | `best` | `best` / `worst` / `112`(1080P高码率) / `80`(1080P) / `64`(720P) / `32`(480P) / `16`(360P)；没有权限的档位自动降到可达的最高档，回报的是实际档位 |
+| 读取本机 B 站登录凭证 | 开 | 关掉 = 纯匿名，最高只到 480P |
+| B 站凭证文件路径 | 空 | 空 = 按 `DSH_BILI_CREDENTIAL` → `%APPDATA%\dsh-desktop\harness\bili-duty` → `$DSH_HOME` / `~/.dsh` 顺序自动查找 |
+| ffmpeg 路径 | 空 | 空 = 自动探测；填错会退回自动探测，不会让下载直接失败 |
+| yt-dlp 路径 | 空 | 同上 |
+| yt-dlp 代理 | 空 | 只作用于非 B 站站点；B 站 一律直连（抖音也强制直连） |
+
+优先级：**单次工具调用的显式传参 > 设置页 > 环境变量 > 内置默认**。环境变量（`DSH_VIDEO_DOWNLOAD_DIR` / `DSH_BILI_CREDENTIAL` / `DSH_FFMPEG_PATH` / `DSH_YTDLP_PATH` / `DSH_YTDLP_PROXY`）仍可用，但设置页里填了就以设置页为准。
+
+设置面板只存**路径指针**，不存凭证内容：SESSDATA 等敏感值依旧只躺在你自己的凭证文件里，面板不读也不回显。
+
 ## 支持范围
 
 - **B 站**：BV 号、标准页面链接、`b23.tv` 短链、多 P（`?p=`）。走内置解析；能读到 B 站登录凭证时清晰度上限等于账号权限（大会员可到 1080P+ / 4K / 8K），读不到就退回匿名（最高 480P）。凭证文件按 `DSH_BILI_CREDENTIAL` → `%APPDATA%\dsh-desktop\harness\bili-duty\bili_credential.json` → `$DSH_HOME` / `~/.dsh` 下的 `bili_credential.json` 顺序找，支持 `sessdata` / `bili_jct` / `buvid3` / `dedeuserid` 字段（值可以是 URL 编码）；凭证过期或文件损坏自动退回匿名，不会把请求弄挂。

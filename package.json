@@ -1,6 +1,6 @@
 {
   "name": "dsh-video-downloader",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "DSH video downloader: Bilibili built-in, Douyin via local headless browser (warm, no cookie), yt-dlp for other sites",
   "type": "module",
   "main": "src/index.js",

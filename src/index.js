@@ -27,9 +27,75 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { Readable } from 'node:stream'
 import { homedir, tmpdir } from 'node:os'
+import { loadSchemastery } from './hostdeps.js'
 
 export const name = 'dsh-video-downloader'
 export const inject = ['tools']
+
+// ------------------------------------------------------------------ 设置页
+// 表单由 DSH 原生「设置 → 插件」按 volatile 字段自动生成，这里不写前端。
+// 优先级：单次工具调用显式传参 > 面板设置 > 环境变量 > 内置默认。
+// 留空 = 没设（退回下一层），所以清空设置页不会让插件失效。
+const z = await loadSchemastery()
+
+export const Config = !z
+  ? undefined
+  : z.object({
+      downloadDir: z
+        .string()
+        .default('')
+        .description('默认下载目录；留空 = 系统 Downloads\\dsh-video-downloader')
+        .extra('volatile', true),
+      defaultQuality: z
+        .string()
+        .default('best')
+        .description('默认清晰度偏好：best（默认）/ worst / 112=1080P高码率 / 80=1080P / 64=720P / 32=480P / 16=360P')
+        .extra('volatile', true),
+      biliUseCredential: z
+        .boolean()
+        .default(true)
+        .description('读取本机 B 站登录凭证（关闭 = 纯匿名，最高只到 480P）')
+        .extra('volatile', true),
+      biliCredentialPath: z
+        .string()
+        .default('')
+        .description('B 站凭证文件路径；留空 = 按顺序自动查找')
+        .extra('volatile', true),
+      ffmpegPath: z
+        .string()
+        .default('')
+        .description('ffmpeg 可执行文件路径；留空 = 自动探测（填错会退回自动探测）')
+        .extra('volatile', true),
+      ytdlpPath: z
+        .string()
+        .default('')
+        .description('yt-dlp 可执行文件路径；留空 = 自动探测（填错会退回自动探测）')
+        .extra('volatile', true),
+      ytdlpProxy: z
+        .string()
+        .default('')
+        .description('yt-dlp 代理地址（只作用于非 B 站站点；B 站 一律直连）')
+        .extra('volatile', true),
+    })
+
+/** 当前面板配置：cordis 把 fiber.config 传进 apply，volatile 字段改动会就地改它。 */
+let panel = {}
+
+export function setPanelConfig(config) {
+  panel = config && typeof config === 'object' ? config : {}
+}
+
+/** 面板里的字符串项：非字符串或空白一律当作「没设」。 */
+function panelStr(key) {
+  const v = panel?.[key]
+  return typeof v === 'string' ? v.trim() : ''
+}
+
+/** 面板里的布尔项：没设时用 fallback。 */
+function panelBool(key, fallback) {
+  const v = panel?.[key]
+  return typeof v === 'boolean' ? v : fallback
+}
 
 // ---------------------------------------------------------------- constants
 
@@ -480,8 +546,13 @@ export function defaultFileName(url, ext) {
   return `${base || 'media'}.${ext || 'mp4'}`
 }
 
-/** Default download directory: explicit env override, then the user's Downloads folder. */
+/**
+ * 默认下载目录：面板设置 → 环境变量 → 用户 Downloads 目录。
+ * 面板留空等于没设，因此清空设置页不会让下载失效。
+ */
 export function defaultDownloadDir() {
+  const fromPanel = panelStr('downloadDir')
+  if (fromPanel) return resolve(fromPanel)
   const env = process.env.DSH_VIDEO_DOWNLOAD_DIR
   if (env && env.trim()) return resolve(env.trim())
   return join(homedir(), 'Downloads', 'dsh-video-downloader')
@@ -615,11 +686,17 @@ let anonJar = ''
  * 所以不永久缓存：过期后重读一次文件并重新探测登录态。
  */
 const BILI_AUTH_TTL_MS = 60_000
-let authMemo = { at: 0, cookie: '', loggedIn: false }
+let authMemo = { at: 0, cookie: '', loggedIn: false, key: '' }
 
-/** 凭证文件候选位置：显式环境变量优先，其次本机 B站 插件的家目录。 */
+/**
+ * 凭证文件候选位置：面板路径 → 显式环境变量 → 本机 B站 插件的家目录。
+ * 面板里关掉「读取登录凭证」时返回空数组（纯匿名，最高 480P）。
+ */
 function biliCredentialPaths() {
+  if (!panelBool('biliUseCredential', true)) return []
   const out = []
+  const fromPanel = panelStr('biliCredentialPath')
+  if (fromPanel) out.push(fromPanel)
   const explicit = (process.env.DSH_BILI_CREDENTIAL || '').trim()
   if (explicit) out.push(explicit)
   const appData = (process.env.APPDATA || '').trim()
@@ -738,18 +815,20 @@ function mergeCookie(anon, extra) {
  * 有凭证时用 nav 探一次登录态，探不通就退回匿名，绝不因为凭证过期把请求弄挂。
  */
 async function bilibiliCookie(signal) {
-  if (Date.now() - authMemo.at < BILI_AUTH_TTL_MS) return authMemo.cookie
+  // 面板里改了「是否读凭证 / 凭证路径」要立刻生效，所以缓存键带上这两项。
+  const credKey = `${panelBool('biliUseCredential', true)}|${panelStr('biliCredentialPath')}`
+  if (Date.now() - authMemo.at < BILI_AUTH_TTL_MS && authMemo.key === credKey) return authMemo.cookie
   const anon = await anonymousBiliCookie(signal)
   const credential = loadBiliCredential()
   if (credential) {
     const merged = mergeCookie(anon, credential)
     if (await bilibiliLoginProbe(merged, signal)) {
-      authMemo = { at: Date.now(), cookie: merged, loggedIn: true }
+      authMemo = { at: Date.now(), cookie: merged, loggedIn: true, key: credKey }
       return merged
     }
   }
   const cookie = mergeCookie(anon, null)
-  authMemo = { at: Date.now(), cookie, loggedIn: false }
+  authMemo = { at: Date.now(), cookie, loggedIn: false, key: credKey }
   return cookie
 }
 
@@ -878,22 +957,34 @@ export async function resolveBilibili(input, { signal, quality = 'best' } = {}) 
 // ------------------------------------------------------------------ ffmpeg
 
 let ffmpegProbe = null
+let ffmpegProbeKey = null
 
-/** Locate ffmpeg once; returns the command or '' when unavailable. */
-export function findFfmpeg() {
-  if (ffmpegProbe !== null) return ffmpegProbe
-  const envPath = process.env.DSH_FFMPEG_PATH
-  if (envPath) {
-    ffmpegProbe = envPath
-    return ffmpegProbe
-  }
-  ffmpegProbe = ''
+/**
+ * 判断一个候选可执行文件是否真能用：绝对路径必须存在，且版本命令跑得通。
+ * 不可用返回 ''（调用方据此回落到下一层）。
+ */
+function usableBin(candidate, versionArgs, timeoutMs) {
+  const p = String(candidate || '').trim()
+  if (!p) return ''
+  if (isAbsolute(p) && !existsSync(p)) return ''
   try {
-    execFileSync('ffmpeg', ['-version'], { stdio: 'ignore', timeout: 5000 })
-    ffmpegProbe = 'ffmpeg'
+    execFileSync(p, versionArgs, { stdio: 'ignore', timeout: timeoutMs })
+    return p
   } catch {
-    ffmpegProbe = ''
+    return ''
   }
+}
+
+/**
+ * Locate ffmpeg：面板设置 → 环境变量 → PATH 自动探测。
+ * 缓存按「当前生效的显式路径」失效 —— 改设置后不用重启就能重新探测；
+ * 填错路径不会让下载直接失败，落回自动探测。
+ */
+export function findFfmpeg() {
+  const explicit = panelStr('ffmpegPath') || (process.env.DSH_FFMPEG_PATH || '').trim()
+  if (ffmpegProbe !== null && ffmpegProbeKey === explicit) return ffmpegProbe
+  ffmpegProbe = usableBin(explicit, ['-version'], 5000) || usableBin('ffmpeg', ['-version'], 5000)
+  ffmpegProbeKey = explicit
   return ffmpegProbe
 }
 
@@ -1005,25 +1096,20 @@ export async function downloadBilibili(input, { outPath, signal, quality = 'best
 // state, so this plugin does not have to chase site changes.
 
 let ytdlpProbe = null
+let ytdlpProbeKey = null
 
-/** Locate yt-dlp once; returns the command or '' when unavailable. */
+/**
+ * Locate yt-dlp：面板设置 → 环境变量 → PATH 自动探测。
+ * 与 ffmpeg 同样按「生效的显式路径」失效缓存，填错路径落回自动探测。
+ */
 export function findYtDlp() {
-  if (ytdlpProbe !== null) return ytdlpProbe
-  const envPath = process.env.DSH_YTDLP_PATH
-  if (envPath) {
-    ytdlpProbe = envPath
-    return ytdlpProbe
-  }
-  ytdlpProbe = ''
-  for (const cmd of ['yt-dlp', 'yt-dlp.exe']) {
-    try {
-      execFileSync(cmd, ['--version'], { stdio: 'ignore', timeout: 8000 })
-      ytdlpProbe = cmd
-      break
-    } catch {
-      // try the next candidate
-    }
-  }
+  const explicit = panelStr('ytdlpPath') || (process.env.DSH_YTDLP_PATH || '').trim()
+  if (ytdlpProbe !== null && ytdlpProbeKey === explicit) return ytdlpProbe
+  ytdlpProbe =
+    usableBin(explicit, ['--version'], 8000) ||
+    usableBin('yt-dlp', ['--version'], 8000) ||
+    usableBin('yt-dlp.exe', ['--version'], 8000)
+  ytdlpProbeKey = explicit
   return ytdlpProbe
 }
 
@@ -1052,7 +1138,7 @@ function ytdlpMessage(stderr, code) {
 
 function ytdlpArgs(url, { cookies } = {}) {
   const args = ['--no-playlist', '--no-warnings', '--no-mtime', '--newline']
-  const explicit = (process.env.DSH_YTDLP_PROXY || '').trim()
+  const explicit = panelStr('ytdlpProxy') || (process.env.DSH_YTDLP_PROXY || '').trim()
   if (explicit) args.push('--proxy', explicit)
   // Douyin rejects requests that arrive through a desktop system proxy with
   // `Blocked by ArgusSecurityPlugin`; ask for a direct connection there unless
@@ -1662,7 +1748,9 @@ const renderText = (_args, value) => [{ type: 'text', text: value }]
 
 const OUTPUT = { schema: { type: 'string' }, render: renderText }
 
-export function apply(ctx) {
+export function apply(ctx, config) {
+  // 设置页的值就挂在 fiber.config 上；volatile 字段改动会就地改它，所以这里只存引用。
+  setPanelConfig(config)
   ctx.tools.register(defineTool({
     name: 'video_analyze',
     description:
@@ -1700,7 +1788,7 @@ export function apply(ctx) {
       const url = String(args.url).trim()
       try {
         if (isResolvablePage(url)) {
-          const info = await resolveBilibili(url, { signal: exec?.signal, quality: args.quality || 'best' })
+          const info = await resolveBilibili(url, { signal: exec?.signal, quality: args.quality || panelStr('defaultQuality') || 'best' })
           return JSON.stringify(info, null, 2)
         }
         if (routeFor(url) === 'ytdlp') {
@@ -1768,7 +1856,7 @@ export function apply(ctx) {
         if (route === 'bilibili') {
           const info = await downloadBilibili(url, {
             outPath: args.outPath,
-            quality: args.quality || 'best',
+            quality: args.quality || panelStr('defaultQuality') || 'best',
             signal: controller.signal,
           })
           return JSON.stringify({ backend: 'bilibili', ...info, elapsedMs: Date.now() - started })
@@ -1795,7 +1883,7 @@ export function apply(ctx) {
           const info = await downloadWithYtDlp(url, {
             outPath: args.outPath,
             cookies: args.cookies,
-            quality: args.quality || 'best',
+            quality: args.quality || panelStr('defaultQuality') || 'best',
             signal: controller.signal,
           })
           return JSON.stringify({ ...info, elapsedMs: Date.now() - started })
