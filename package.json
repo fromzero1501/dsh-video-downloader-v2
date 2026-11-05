@@ -1,15 +1,17 @@
 {
   "name": "dsh-video-downloader",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "DSH video downloader: Bilibili built-in, Douyin via local headless browser (warm, no cookie), yt-dlp for other sites",
   "type": "module",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "src",
+    "client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -54,6 +56,14 @@
     "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
     }
   }
 }

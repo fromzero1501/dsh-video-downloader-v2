@@ -19,7 +19,7 @@
  * Schema, which is exactly what `ctx.tools.register()` consumes.
  */
 
-import { createWriteStream, mkdirSync, mkdtempSync, statSync } from 'node:fs'
+import { createWriteStream, mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs'
 import { existsSync, readFileSync } from 'node:fs'
 import { renameSync, unlinkSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -85,16 +85,88 @@ export function setPanelConfig(config) {
   panel = config && typeof config === 'object' ? config : {}
 }
 
+/** 可配置项与类型（设置页、路由、校验共用一张表）。 */
+const CONFIG_KEYS = {
+  downloadDir: 'string',
+  defaultQuality: 'string',
+  biliUseCredential: 'boolean',
+  biliCredentialPath: 'string',
+  ffmpegPath: 'string',
+  ytdlpPath: 'string',
+  ytdlpProxy: 'string',
+}
+
+/** 本插件自己的设置文件目录：$DSH_HOME/video-downloader。 */
+function stateDirOf() {
+  const home = (process.env.DSH_HOME || '').trim()
+  return home ? join(home, 'video-downloader') : join(homedir(), '.dsh', 'video-downloader')
+}
+
+export function configFilePath() {
+  return join(stateDirOf(), 'config.json')
+}
+
+let localMemo = { at: 0, mtime: -1, data: {} }
+
+/** 读设置页存下的本地配置。按 mtime 失效，1 秒内复用（挡住页面 15 秒轮询之外的重读）。 */
+function readLocalConfig() {
+  const file = configFilePath()
+  let mtime = -1
+  try {
+    mtime = statSync(file).mtimeMs
+  } catch {
+    return {}
+  }
+  if (localMemo.mtime === mtime && Date.now() - localMemo.at < 1000) return localMemo.data
+  let data = {}
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed
+  } catch {
+    data = {}
+  }
+  localMemo = { at: Date.now(), mtime, data }
+  return data
+}
+
+/** 写本地配置：只动点名的键；传 null 表示删掉该键（回到「没设」）。写完立刻让缓存失效。 */
+function writeLocalConfig(patch) {
+  const next = { ...readLocalConfig() }
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (!(key in CONFIG_KEYS)) continue
+    if (value === null || value === undefined) delete next[key]
+    else next[key] = value
+  }
+  mkdirSync(stateDirOf(), { recursive: true })
+  writeFileSync(configFilePath(), JSON.stringify(next, null, 2) + '\n', 'utf8')
+  localMemo = { at: 0, mtime: -1, data: {} }
+  return next
+}
+
+/**
+ * 某一项的生效值与来源：设置页（本地 config.json）> DSH 原生插件设置（fiber.config）> 默认。
+ * 本地优先是有原因的：DSH 某些启动方式下 `ctx.settings.update` 写不进生效层，
+ * 若以宿主那份为准，用户在面板上改完会被旧值压回，表现为「改了没反应」。
+ */
+function configEntry(key) {
+  const local = readLocalConfig()
+  if (key in local) return { value: local[key], source: 'local' }
+  const v = panel?.[key]
+  if (typeof v === 'string' && v.trim()) return { value: v.trim(), source: 'native' }
+  if (typeof v === 'boolean') return { value: v, source: 'native' }
+  return { value: undefined, source: 'default' }
+}
+
 /** 面板里的字符串项：非字符串或空白一律当作「没设」。 */
 function panelStr(key) {
-  const v = panel?.[key]
-  return typeof v === 'string' ? v.trim() : ''
+  const e = configEntry(key)
+  return typeof e.value === 'string' ? e.value : ''
 }
 
 /** 面板里的布尔项：没设时用 fallback。 */
 function panelBool(key, fallback) {
-  const v = panel?.[key]
-  return typeof v === 'boolean' ? v : fallback
+  const e = configEntry(key)
+  return typeof e.value === 'boolean' ? e.value : fallback
 }
 
 // ---------------------------------------------------------------- constants
@@ -1742,6 +1814,213 @@ export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
   }
 }
 
+// ------------------------------------------------------------ settings page
+// 左侧栏「视频下载」这一页的后端：GET 读状态、POST 存设置。
+// 只在有 HTTP 面（web / 桌面端）时挂上；headless 拿不到 webServer 就跳过，工具照常可用。
+
+function sendJson(res, code, obj) {
+  try {
+    res.statusCode = code
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.end(JSON.stringify(obj))
+  } catch {
+    // 连接已经断了，没什么可做的
+  }
+}
+
+/** 只接受本机同源：Host 必须是回环；带了 Origin/Referer 时端口也要对得上。 */
+function sameOriginOk(req) {
+  try {
+    const host = String(req.headers.host || '')
+    if (!host) return true // 没有 Host 头 = 不是浏览器发的
+    if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host)) return false
+    const pick = String(req.headers.origin || req.headers.referer || '')
+    if (!pick) return true
+    try {
+      const u = new URL(pick)
+      const authority = String(u.host || '').toLowerCase()
+      if (authority && authority === host.toLowerCase()) return true
+      const port = u.port || (u.protocol === 'https:' ? '443' : '80')
+      return (u.hostname + ':' + port).toLowerCase() === host.toLowerCase()
+    } catch {
+      return false
+    }
+  } catch {
+    return false
+  }
+}
+
+/** 先过 DSH 自己的信任栅栏（认 cookie / token）；拿不到就只靠上面那道同源检查。 */
+function fenceReject(ctx, req, res) {
+  let conn = null
+  try {
+    conn = (typeof ctx.get === 'function' ? ctx.get('connection') : null) || Reflect.get(ctx, 'connection')
+  } catch {
+    conn = null
+  }
+  if (!conn || typeof conn.requestRejection !== 'function') return false
+  try {
+    const rejection = conn.requestRejection({ headers: req.headers })
+    if (rejection === undefined) return false
+    res.statusCode = typeof rejection === 'number' ? rejection : 403
+    res.end()
+    return true
+  } catch {
+    res.statusCode = 403
+    try { res.end() } catch { /* 忽略 */ }
+    return true
+  }
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let raw = ''
+    req.on('data', (chunk) => {
+      raw += chunk
+      if (raw.length > 100_000) req.destroy()
+    })
+    req.on('end', () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {})
+      } catch {
+        resolve(null)
+      }
+    })
+    req.on('error', () => resolve(null))
+  })
+}
+
+/** 当前生效值 + 只读状态。probe=true 时联网探一次 B站 登录态（页面 15 秒轮询用）。 */
+async function settingsSnapshot({ probe = false } = {}) {
+  const values = {}
+  const sources = {}
+  for (const key of Object.keys(CONFIG_KEYS)) {
+    const entry = configEntry(key)
+    values[key] = entry.value !== undefined
+      ? entry.value
+      : key === 'defaultQuality' ? 'best' : key === 'biliUseCredential' ? true : ''
+    sources[key] = entry.source
+  }
+  const found = biliCredentialPaths().find((file) => {
+    try { return existsSync(file) } catch { return false }
+  }) || null
+  const status = {
+    ffmpeg: findFfmpeg(),
+    ytdlp: findYtDlp(),
+    downloadDir: defaultDownloadDir(),
+    credential: found,
+    loggedIn: null,
+  }
+  if (probe) {
+    try {
+      const cookie = await bilibiliCookie()
+      status.loggedIn = cookie ? await bilibiliLoginProbe(cookie) : false
+    } catch {
+      status.loggedIn = null
+    }
+  }
+  return { ok: true, values, sources, status }
+}
+
+/** 校验 + 落盘。返回 { warnings, persisted }，不合法的项直接抛错（不静默吞）。 */
+function applySettingsPatch(patch) {
+  const warnings = []
+  for (const [key, value] of Object.entries(patch)) {
+    if (!(key in CONFIG_KEYS)) throw new Error('不认识的设置项：' + key)
+    if (value === null) continue
+    if (typeof value !== CONFIG_KEYS[key]) {
+      throw new Error(`设置项 ${key} 需要${CONFIG_KEYS[key] === 'boolean' ? '布尔' : '字符串'}值`)
+    }
+    if (typeof value === 'string') {
+      const text = value.trim()
+      if ((key === 'ffmpegPath' || key === 'ytdlpPath') && text && isAbsolute(text) && !existsSync(text)) {
+        warnings.push(`${key === 'ffmpegPath' ? 'ffmpeg' : 'yt-dlp'} 路径不存在，已退回自动探测`)
+      }
+      if (key === 'downloadDir' && text) {
+        try {
+          mkdirSync(resolve(text), { recursive: true })
+        } catch {
+          warnings.push('下载目录建不出来（可能没权限）：' + text)
+        }
+      }
+    }
+  }
+  writeLocalConfig(patch)
+  return { warnings }
+}
+
+/** 尽力把改动同步进 DSH 原生插件设置层（写不进去不算失败，本地那份已经在生效）。 */
+async function syncToHostSettings(ctx, patch) {
+  try {
+    const describe = ctx?.settings?.describe
+    const update = ctx?.settings?.update
+    if (typeof describe !== 'function' || typeof update !== 'function') return 'host-unavailable'
+    const rows = describe.call(ctx.settings) || []
+    const row = rows.find((r) => r && r.value && typeof r.value === 'object'
+      && 'downloadDir' in r.value && 'defaultQuality' in r.value && 'ytdlpProxy' in r.value)
+    if (!row?.ns) return 'host-unavailable'
+    await update.call(ctx.settings, row.ns, patch, row.revision)
+    return 'ok'
+  } catch (e) {
+    return 'host-failed: ' + String(e?.message ?? e)
+  }
+}
+
+/** 挂上 /api/video-downloader（GET /state、POST /config）。没有 HTTP 面就安静跳过。 */
+function registerSettingsRoute(ctx) {
+  let webServer = null
+  try {
+    webServer = (typeof ctx.get === 'function' ? ctx.get('webServer') : null) || ctx.webServer || null
+  } catch {
+    webServer = null
+  }
+  if (!webServer || typeof webServer.register !== 'function') return
+
+  const handler = async (req, res) => {
+    if (fenceReject(ctx, req, res)) return
+    if (!sameOriginOk(req)) {
+      sendJson(res, 403, { ok: false, error: '只接受本机同源请求' })
+      return
+    }
+    const url = new URL(req.url, 'http://127.0.0.1')
+    try {
+      if (req.method === 'GET' && url.pathname === '/api/video-downloader/state') {
+        sendJson(res, 200, await settingsSnapshot({ probe: url.searchParams.get('probe') === '1' }))
+        return
+      }
+      if (req.method === 'POST' && url.pathname === '/api/video-downloader/config') {
+        const body = await readJsonBody(req)
+        if (!body || typeof body !== 'object' || !body.patch || typeof body.patch !== 'object') {
+          sendJson(res, 400, { ok: false, error: '请求体要是 { patch: {…} }' })
+          return
+        }
+        const { warnings } = applySettingsPatch(body.patch)
+        const host = await syncToHostSettings(ctx, body.patch)
+        const snapshot = await settingsSnapshot({ probe: false })
+        sendJson(res, 200, {
+          ...snapshot,
+          persisted: Object.keys(body.patch),
+          host,
+          warnings,
+        })
+        return
+      }
+      sendJson(res, 404, { ok: false, error: '没有这个接口' })
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: String(e?.message ?? e) })
+    }
+  }
+
+  try {
+    ctx.effect(
+      () => webServer.register({ kind: 'prefix', path: '/api/video-downloader', handler }),
+      'video-downloader: /api/video-downloader 路由',
+    )
+  } catch {
+    // 挂不上只是没有面板后端，工具不受影响
+  }
+}
+
 // -------------------------------------------------------------------- tools
 
 const renderText = (_args, value) => [{ type: 'text', text: value }]
@@ -1930,4 +2209,7 @@ export function apply(ctx, config) {
       return JSON.stringify({ quality: getQuality(url), ext: getExt(url) })
     },
   }))
+
+  // 左侧栏「视频下载」那一页的后端接口（没有 HTTP 面时安静跳过）
+  registerSettingsRoute(ctx)
 }
