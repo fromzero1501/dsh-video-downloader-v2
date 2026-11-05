@@ -21,7 +21,10 @@ window.__ModuleLoader__.load({
     /** 只认 2xx：HTTP 500 的 { ok:false } 绝不能被当成"已保存"。 */
     const asJson = async (res) => {
       if (res.ok) return res.json()
-      const why = res.status === 401 ? '（未登录 / 没权限）' : res.status === 403 ? '（被宿主拦了）' : ''
+      const why = res.status === 401 ? '（未登录 / 没权限）'
+      : res.status === 403 ? '（被宿主拦了）'
+      : res.status === 404 ? '（后端接口没挂上：重启 DSH 桌面端后重试，或看插件日志）'
+      : ''
       let detail = ''
       try { const j = await res.json(); if (j && j.error) detail = '：' + j.error } catch { /* 没有 JSON 就算了 */ }
       throw new Error('HTTP ' + res.status + why + detail)

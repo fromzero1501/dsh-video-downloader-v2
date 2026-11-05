@@ -1968,13 +1968,47 @@ async function syncToHostSettings(ctx, patch) {
 
 /** 挂上 /api/video-downloader（GET /state、POST /config）。没有 HTTP 面就安静跳过。 */
 function registerSettingsRoute(ctx) {
-  let webServer = null
-  try {
-    webServer = (typeof ctx.get === 'function' ? ctx.get('webServer') : null) || ctx.webServer || null
-  } catch {
-    webServer = null
+  let disposeRoute = null
+  let retryTimer = null
+  let tries = 0
+  const MAX_TRIES = 120
+
+  const logLine = (msg) => {
+    const text = '[video-downloader] ' + msg
+    try { ctx.logger?.info?.(text) } catch { /* 宿主 logger 形状不一时忽略 */ }
+    try { console.log(text) } catch { /* 忽略 */ }
   }
-  if (!webServer || typeof webServer.register !== 'function') return
+
+  const webServerNow = () => {
+    try {
+      const viaGet = typeof ctx.get === 'function' ? ctx.get('webServer') : null
+      return viaGet || ctx.webServer || null
+    } catch {
+      return null
+    }
+  }
+
+  const stopRetry = () => {
+    if (!retryTimer) return
+    try { clearInterval(retryTimer) } catch { /* 忽略 */ }
+    retryTimer = null
+  }
+
+  /** 返回 true 表示已经挂上（或早就挂过）。 */
+  const tryRegister = () => {
+    if (disposeRoute) return true
+    const webServer = webServerNow()
+    if (!webServer || typeof webServer.register !== 'function') return false
+    try {
+      disposeRoute = webServer.register({ kind: 'prefix', path: '/api/video-downloader', handler })
+      stopRetry()
+      logLine('设置页后端已挂上 /api/video-downloader')
+      return true
+    } catch (e) {
+      logLine('设置页后端挂载失败：' + String(e?.message ?? e))
+      return false
+    }
+  }
 
   const handler = async (req, res) => {
     if (fenceReject(ctx, req, res)) return
@@ -2011,14 +2045,40 @@ function registerSettingsRoute(ctx) {
     }
   }
 
+  // ① 当场试一次。cordis 的 ctx.get() 默认 strict：服务提供方还没激活时返回 undefined，
+  //    所以 apply 阶段拿不到 webServer 是正常现象，不能据此判定「没有 HTTP 面」。
+  if (!tryRegister()) {
+    // ② 等 webServer 就绪：服务可用时 cordis 会发 internal/service 事件。
+    try {
+      ctx.on('internal/service', (name) => {
+        if (name === 'webServer') tryRegister()
+      })
+    } catch { /* 老版本没这个事件就走 ③ */ }
+    // ③ 兜底：1 秒一次、2 分钟封顶，避免事件没到时永远挂不上。
+    retryTimer = setInterval(() => {
+      tries += 1
+      if (tryRegister()) return
+      if (tries >= MAX_TRIES) {
+        stopRetry()
+        logLine('等了 ' + MAX_TRIES + ' 秒仍没有 webServer：当前环境没有 HTTP 面，设置页后端跳过')
+      }
+    }, 1000)
+    try { retryTimer.unref?.() } catch { /* 有的宿主定时器没有 unref */ }
+  }
+
+  // 插件卸载时收掉路由与定时器。
   try {
     ctx.effect(
-      () => webServer.register({ kind: 'prefix', path: '/api/video-downloader', handler }),
-      'video-downloader: /api/video-downloader 路由',
+      () => () => {
+        stopRetry()
+        if (disposeRoute) {
+          try { disposeRoute() } catch { /* 忽略 */ }
+          disposeRoute = null
+        }
+      },
+      'video-downloader: /api/video-downloader 路由与重试清理',
     )
-  } catch {
-    // 挂不上只是没有面板后端，工具不受影响
-  }
+  } catch { /* 没有 effect 就随进程走 */ }
 }
 
 // -------------------------------------------------------------------- tools
