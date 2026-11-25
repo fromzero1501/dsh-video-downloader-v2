@@ -1,0 +1,485 @@
+/**
+ * 关键词批量爬取（P0：快手）。纯 node 内建模块，不依赖宿主包。
+ *
+ * 目录口径： <根>\<平台中文名>\<用户原始关键词>\<标题 [视频id].mp4
+ * 索引：     $DSH_HOME/video-downloader/index.jsonl（一行一条，去重键 平台:id）
+ * 任务态：   $DSH_HOME/video-downloader/crawl/<jobId>.json
+ *
+ * 行为约定（与用户确认过）：
+ *   - 抓多少条由调用方给，没给就 10 条。
+ *   - 先同词翻页到底；不够条数再用同义词逐个搜（同义词由 agent 生成后传进来）。
+ *   - 遇限流退避重试；遇验证码/风控立刻暂停并留证据，等人工处理后 resume。
+ *   - 已在索引里且文件还在盘的条目跳过（可重复跑，增量）。
+ */
+
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { Readable } from 'node:stream'
+import { randomBytes } from 'node:crypto'
+import { kuaishouFeeds, kuaishouFileName, kuaishouVerdict, openKuaishouSession } from './kuaishou.js'
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+
+const PLATFORM_LABELS = {
+  kuaishou: '快手',
+  bilibili: 'B站',
+  youtube: 'YouTube',
+  douyin: '抖音',
+  xiaohongshu: '小红书',
+  other: '其他',
+}
+
+/** 平台标识 → 落盘用的中文目录名。 */
+export function platformLabel(platform) {
+  const key = String(platform || '').trim().toLowerCase()
+  return PLATFORM_LABELS[key] || key || '其他'
+}
+
+/** 目录名清洗：保留中文与空格，去掉 Windows 非法字符与首尾点。 */
+export function safeDirName(name) {
+  const s = String(name || '')
+    .replace(/[\\/:*?"<>|\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/, '')
+    .slice(0, 60)
+  return s || '未命名'
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** 一次爬取的默认值：用户没说条数就 10 条。 */
+export const CRAWL_DEFAULT_LIMIT = 10
+export const CRAWL_DEFAULT_MAX_PAGES = 10
+
+export function crawlDirName(stateDir) {
+  return join(stateDir, 'crawl')
+}
+
+export function crawlIndexPath(stateDir) {
+  return join(stateDir, 'index.jsonl')
+}
+
+/** 读索引成 Map：key = `平台:id` → { file, bytes, at }。坏行跳过。 */
+export function loadCrawlIndex(file) {
+  const map = new Map()
+  let raw = ''
+  try {
+    raw = readFileSync(file, 'utf8')
+  } catch {
+    return map
+  }
+  for (const line of raw.split('\n')) {
+    const text = line.trim()
+    if (!text) continue
+    try {
+      const row = JSON.parse(text)
+      if (row && row.platform && row.id) map.set(`${row.platform}:${row.id}`, row)
+    } catch {}
+  }
+  return map
+}
+
+/** 已下过且文件仍在盘才算命中——文件被删了要能补回来。 */
+export function indexHit(index, platform, id) {
+  const row = index.get(`${platform}:${id}`)
+  if (!row || !row.file) return null
+  try {
+    if (statSync(row.file).size > 0) return row
+  } catch {}
+  return null
+}
+
+/**
+ * 下载前的筛选：最早发布时间、最低点赞（=喜欢）、最低观看量。
+ * 三个条件都为 0 表示不筛。没有发布时间的数据在设了时间筛选时算不合格。
+ */
+export function passesCrawlFilter(row, { minLike = 0, minView = 0, maxAgeDays = 0, now = Date.now() } = {}) {
+  if (minLike > 0 && (Number(row.likeCount) || 0) < minLike) return false
+  if (minView > 0 && (Number(row.viewCount) || 0) < minView) return false
+  if (maxAgeDays > 0) {
+    const ts = Number(row.timestampMs) || 0
+    if (!ts) return false
+    if (now - ts > maxAgeDays * 86400000) return false
+  }
+  return true
+}
+
+/** 把可选的筛选参数归一成数字：空串/undefined/负数都算「不限」。 */
+export function normalizeCrawlFilters(raw = {}) {
+  const num = (v) => {
+    const n = Number(String(v ?? '').trim())
+    return Number.isFinite(n) && n > 0 ? n : 0
+  }
+  return { minLike: num(raw.minLike), minView: num(raw.minView), maxAgeDays: num(raw.maxAgeDays) }
+}
+
+/** 下载一条直链到文件，失败时按 backupUrl 逐个重试。 */
+async function downloadDirect(url, file, { signal, backupUrls = [] } = {}) {
+  const headers = { 'user-agent': UA, referer: 'https://www.kuaishou.com/', accept: '*/*' }
+  const once = async (target) => {
+    const res = await fetch(target, { headers, signal, redirect: 'follow' })
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+    const ws = createWriteStream(file)
+    let bytes = 0
+    const src = Readable.fromWeb(res.body)
+    src.on('data', (chunk) => { bytes += chunk.length })
+    await new Promise((res2, rej) => {
+      src.on('error', rej)
+      ws.on('error', rej)
+      ws.on('finish', res2)
+      src.pipe(ws)
+    })
+    return bytes
+  }
+  const candidates = [url, ...backupUrls.filter((u) => u && u !== url)]
+  let lastErr = null
+  for (const target of candidates) {
+    try {
+      return await once(target)
+    } catch (err) {
+      lastErr = err
+      if (signal?.aborted) break
+    }
+  }
+  throw lastErr || new Error('没有可用的下载地址')
+}
+
+class PauseSignal extends Error {
+  constructor(reason, detail) {
+    super(reason)
+    this.code = 'need_human'
+    this.reason = reason
+    this.detail = detail
+  }
+}
+
+/**
+ * 爬取任务管理器。一个实例管若干 job；job 是异步跑的，start 立刻返回。
+ */
+export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', defaultFilters = {}, log = () => {} }) {
+  const indexFile = crawlIndexPath(stateDir)
+  const jobsDir = crawlDirName(stateDir)
+  const profileDir = join(stateDir, 'kuaishou', 'profile')
+  const jobs = new Map()
+  const aborts = new Map()
+
+  mkdirSync(jobsDir, { recursive: true })
+
+  const jobPath = (id) => join(jobsDir, `${id}.json`)
+
+  function persist(job) {
+    job.updatedAt = new Date().toISOString()
+    try {
+      writeFileSync(jobPath(job.id), JSON.stringify(job, null, 2) + '\n', 'utf8')
+    } catch (err) {
+      log(`job 状态写盘失败：${err?.message || err}`)
+    }
+    return job
+  }
+
+  function readJob(id) {
+    if (jobs.has(id)) return jobs.get(id)
+    try {
+      const job = JSON.parse(readFileSync(jobPath(id), 'utf8'))
+      jobs.set(id, job)
+      return job
+    } catch {
+      return null
+    }
+  }
+
+  function listJobs(limit = 10) {
+    let names = []
+    try {
+      names = readdirSync(jobsDir).filter((n) => n.endsWith('.json'))
+    } catch {
+      return []
+    }
+    const rows = names
+      .map((n) => readJob(n.replace(/\.json$/, '')))
+      .filter(Boolean)
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    return rows.slice(0, limit)
+  }
+
+  function newJobId() {
+    const d = new Date()
+    const p = (n) => String(n).padStart(2, '0')
+    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    return `${platform}-${stamp}-${randomBytes(2).toString('hex')}`
+  }
+
+  function setStatus(job, status, extra = {}) {
+    job.status = status
+    Object.assign(job, extra)
+    log(`[${job.id}] ${status}${job.phase?.word ? ` · ${job.phase.word} · 第 ${job.phase.page} 页` : ''}`)
+    return persist(job)
+  }
+
+  /** 搜索阶段：同词翻页，把结果塞进 job.found。返回是否已够数。 */
+  async function searchPhase(job, session, signal) {
+    const words = [job.keyword, ...(job.synonyms || [])].filter(Boolean)
+    const seenLocal = new Set(job.found.map((x) => x.id))
+    let rateHits = 0
+
+    for (let wi = 0; wi < words.length; wi++) {
+      const word = words[wi]
+      let pcursor = ''
+      let sessionId = ''
+      let pages = 0
+      const visited = new Set()
+
+      while (pages < job.maxPages) {
+        if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
+        job.phase = { word, wordIndex: wi, wordCount: words.length, page: pages + 1 }
+        persist(job)
+
+        const payload = await session.searchOnce({ keyword: word, pcursor, searchSessionId: sessionId })
+        if (payload?.__transport) {
+          throw new PauseSignal('transport', `页面内请求失败：${payload.__transport}`)
+        }
+        const verdict = kuaishouVerdict(payload?.result, payload?.error_msg)
+        if (verdict.kind === 'need_login') throw new PauseSignal('login', verdict.message)
+        if (verdict.kind === 'captcha') throw new PauseSignal('captcha', verdict.message)
+        if (verdict.kind === 'rate_limited') {
+          rateHits += 1
+          if (rateHits >= 3) throw new PauseSignal('rate_limited', verdict.message)
+          log(`限流，等 ${8 * rateHits}s 再试`)
+          await sleep(8000 * rateHits)
+          continue
+        }
+        if (verdict.kind !== 'ok') throw new PauseSignal('blocked', verdict.message)
+        rateHits = 0
+
+        const rows = kuaishouFeeds(payload)
+        job.stats.searched += rows.length
+        for (const row of rows) {
+          if (seenLocal.has(row.id)) continue
+          seenLocal.add(row.id)
+          if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
+          if (!row.source) { job.stats.noSource += 1; continue }
+          job.found.push({ ...row, keyword: word })
+        }
+        job.stats.found = job.found.length
+        persist(job)
+        log(`「${word}」第 ${pages + 1} 页拿到 ${rows.length} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
+
+        if (job.found.length >= job.limit) return true
+        const next = typeof payload?.pcursor === 'string' ? payload.pcursor : ''
+        sessionId = typeof payload?.searchSessionId === 'string' ? payload.searchSessionId : sessionId
+        if (!next || visited.has(next)) break
+        visited.add(next)
+        pcursor = next
+        pages += 1
+        const minDelay = Number(process.env.DSH_KS_PAGE_DELAY_MS) || 1500
+        await sleep(minDelay + Math.floor(Math.random() * 1500))
+      }
+    }
+    return job.found.length >= job.limit
+  }
+
+  /** 下载阶段：并发 2，逐条落盘 + 写索引。 */
+  async function downloadPhase(job, signal) {
+    const index = loadCrawlIndex(indexFile)
+    const queue = job.found.slice(0, job.limit)
+    const targets = []
+    for (const row of queue) {
+      if (indexHit(index, platform, row.id)) {
+        job.stats.skipped += 1
+        row.status = 'skipped'
+        continue
+      }
+      targets.push(row)
+    }
+    persist(job)
+
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < targets.length) {
+        if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
+        const row = targets[cursor++]
+        const file = join(job.dir, kuaishouFileName(row.caption, row.id))
+        try {
+          mkdirSync(job.dir, { recursive: true })
+          const bytes = await downloadDirect(row.source.url, file, { signal, backupUrls: row.source.backupUrl })
+          row.status = 'done'
+          row.file = file
+          row.bytes = bytes
+          job.stats.downloaded += 1
+          job.stats.bytes += bytes
+          try {
+            appendFileSync(indexFile, JSON.stringify({
+              platform, id: row.id, file, bytes, keyword: job.keyword,
+              caption: row.caption.slice(0, 80), author: row.author,
+              at: new Date().toISOString(), jobId: job.id,
+            }) + '\n', 'utf8')
+          } catch (err) {
+            log(`索引写入失败：${err?.message || err}`)
+          }
+          log(`已下载 ${row.id} → ${bytes} 字节`)
+        } catch (err) {
+          row.status = 'failed'
+          row.error = String(err?.message || err)
+          job.stats.failed += 1
+          log(`下载失败 ${row.id}：${row.error}`)
+        }
+        persist(job)
+      }
+    }
+
+    const concurrency = Math.max(1, Math.min(4, job.concurrency || 2))
+    await Promise.all(Array.from({ length: concurrency }, worker))
+    return job.stats.downloaded
+  }
+
+  async function runJob(job) {
+    const controller = new AbortController()
+    aborts.set(job.id, controller)
+    const { signal } = controller
+    let session = null
+    try {
+      job.startedAt = new Date().toISOString()
+      setStatus(job, 'searching')
+      session = await openKuaishouSession({ profileDir, log, signal })
+
+      if (!(await session.hasLogin())) {
+        const qr = join(stateDir, 'kuaishou', `login-${job.id}.png`)
+        setStatus(job, 'waiting_login', { needHuman: { reason: 'login', at: new Date().toISOString(), qrPath: qr, message: '需要扫码登录快手' } })
+        await session.navigate('https://www.kuaishou.com/')
+        await sleep(2500)
+        const saved = await session.screenshot(qr)
+        if (saved) log(`已截登录二维码：${saved}`)
+        const deadline = Date.now() + 180000
+        let ok = false
+        while (Date.now() < deadline) {
+          if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
+          await sleep(3000)
+          if (await session.hasLogin()) { ok = true; break }
+        }
+        if (!ok) throw new PauseSignal('login', '等待扫码登录超时（3 分钟）')
+        job.needHuman = null
+        setStatus(job, 'searching')
+        log('登录态已就绪，继续爬取')
+      }
+
+      await searchPhase(job, session, signal)
+      job.phase = { ...(job.phase || {}), page: 0 }
+      setStatus(job, 'downloading')
+      await downloadPhase(job, signal)
+
+      const done = job.stats.downloaded
+      const total = job.stats.found
+      setStatus(job, done > 0 ? (done >= Math.min(total, job.limit) ? 'done' : 'partial') : 'partial', {
+        finishedAt: new Date().toISOString(),
+      })
+    } catch (err) {
+      if (err instanceof PauseSignal) {
+        const qr = join(stateDir, 'kuaishou', `pause-${job.id}.png`)
+        try { if (session) await session.screenshot(qr) } catch {}
+        setStatus(job, 'paused_need_human', {
+          needHuman: { reason: err.reason, message: err.detail || err.reason, at: new Date().toISOString(), qrPath: qr },
+          error: err.detail || err.reason,
+        })
+      } else if (err?.code === 'canceled' || signal.aborted) {
+        setStatus(job, 'canceled', { finishedAt: new Date().toISOString() })
+      } else {
+        setStatus(job, 'failed', { error: String(err?.message || err), finishedAt: new Date().toISOString() })
+      }
+    } finally {
+      try { if (session) session.close() } catch {}
+      aborts.delete(job.id)
+    }
+  }
+
+  return {
+    indexPath: indexFile,
+    jobsDir,
+    profileDir,
+
+    start(opts) {
+      const keyword = String(opts.keyword || '').trim()
+      if (!keyword) throw Object.assign(new Error('keyword 不能为空'), { code: 'bad_request' })
+      const limit = Number(opts.limit) > 0 ? Math.floor(Number(opts.limit)) : CRAWL_DEFAULT_LIMIT
+      const maxPages = Number(opts.maxPages) > 0 ? Math.floor(Number(opts.maxPages)) : CRAWL_DEFAULT_MAX_PAGES
+      const root = resolve(String(opts.root || defaultRoot || '').trim() || defaultRoot)
+      const dir = join(root, platformLabel(platform), safeDirName(keyword))
+      const job = {
+        id: newJobId(),
+        platform,
+        keyword,
+        synonyms: Array.isArray(opts.synonyms) ? opts.synonyms.map((s) => String(s).trim()).filter(Boolean) : [],
+        root,
+        dir,
+        limit,
+        maxPages,
+        concurrency: Number(opts.concurrency) > 0 ? Math.floor(Number(opts.concurrency)) : 2,
+        filters: normalizeCrawlFilters({ ...defaultFilters, ...(opts.filters || {}), ...opts }),
+        status: 'queued',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        phase: {},
+        stats: { searched: 0, found: 0, filtered: 0, noSource: 0, downloaded: 0, skipped: 0, failed: 0, bytes: 0 },
+        found: [],
+        needHuman: null,
+        error: '',
+      }
+      jobs.set(job.id, job)
+      persist(job)
+      runJob(job).catch((err) => log(`job 异常退出：${err?.message || err}`))
+      return job
+    },
+
+    status(jobId) {
+      if (!jobId) return { jobs: listJobs(10) }
+      const job = readJob(jobId)
+      if (!job) return null
+      return {
+        id: job.id,
+        platform: job.platform,
+        keyword: job.keyword,
+        status: job.status,
+        dir: job.dir,
+        limit: job.limit,
+        filters: job.filters,
+        phase: job.phase,
+        stats: job.stats,
+        needHuman: job.needHuman,
+        error: job.error,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        items: job.found.slice(0, 200).map((r) => ({
+          id: r.id, caption: r.caption.slice(0, 40), author: r.author,
+          status: r.status || 'pending', file: r.file || '', bytes: r.bytes || 0, error: r.error || '',
+        })),
+      }
+    },
+
+    resume(jobId) {
+      const job = readJob(jobId)
+      if (!job) return null
+      if (aborts.has(jobId)) return { ok: false, message: '这个任务还在跑' }
+      if (!['paused_need_human', 'failed', 'waiting_login'].includes(job.status)) {
+        return { ok: false, message: `当前状态 ${job.status} 不需要 resume` }
+      }
+      job.needHuman = null
+      job.error = ''
+      job.status = 'queued'
+      persist(job)
+      runJob(job).catch((err) => log(`job 异常退出：${err?.message || err}`))
+      return { ok: true, job: job.id, status: job.status }
+    },
+
+    cancel(jobId) {
+      const job = readJob(jobId)
+      if (!job) return null
+      const controller = aborts.get(jobId)
+      if (controller) controller.abort(new Error('已取消'))
+      job.status = 'canceled'
+      job.finishedAt = new Date().toISOString()
+      persist(job)
+      return { ok: true, job: jobId, status: 'canceled' }
+    },
+  }
+}

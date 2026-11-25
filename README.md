@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链接就能下载，不需要先拿到直链。
 
-面向 **DSH 0.2.1-rc.2** 重写，三条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底）。
+面向 **DSH 0.2.1-rc.2** 重写，四条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底），快手另有关键词批量爬取（本地浏览器拿签名 → 搜索接口翻页 → CDN 直链下载，不需要 yt-dlp / lux / ffmpeg）。
 
 ## 功能
 
@@ -12,6 +12,10 @@ DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链�
 | `video_resolve` | 把页面链接解析成流清单，不下载：B 站走内置解析，抖音走本地浏览器通路，其他站点走通用后端（yt-dlp → lux） |
 | `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；抖音用本地浏览器取播放流直下；其他站点页面链接交给通用后端（yt-dlp → lux） |
 | `video_quality_parse` | 从 URL 参数推断画质与容器格式，纯本地计算 |
+| `video_crawl` | 按关键词批量爬取快手视频（异步任务，立刻返回 `jobId`）：落盘到 `<根>\快手\<关键词>\`，下载前按「最近 N 天发布 / 最低点赞 / 最低播放量」筛选，索引去重，重复跑是增量 |
+| `video_crawl_status` | 查爬取进度：`phase`（当前关键词 + 第几页）、`stats`（搜到/筛掉/已下/跳过/失败/字节）、`items`、`needHuman`（暂停原因 + 二维码截图路径） |
+| `video_crawl_resume` | 人工处理完验证码 / 扫码后，从索引里已下载的条目之后继续跑 |
+| `video_crawl_cancel` | 取消任务（已下载的文件保留） |
 
 ## 使用示例
 
@@ -22,7 +26,11 @@ video_download  { "url": "https://www.bilibili.com/video/BV1GJ411x7h7" }
 video_download  { "url": "https://www.douyin.com/video/xxxx", "quality": "best" }
 video_download  { "url": "https://www.xiaohongshu.com/explore/xxxx", "cookies": "D:\\cookies.txt" }
 video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\clip.mp4" }
+video_crawl     { "keyword": "和田大枣", "limit": 50, "minLike": 100, "minView": 5000, "maxAgeDays": 30 }
+video_crawl_status { "jobId": "kuaishou-20261125-172248-b549" }
 ```
+
+`video_crawl` 只管把视频抓到盘上，不做关键词扩展——`synonyms` 里传什么就按顺序补搜什么：先把主关键词翻页到底，条数不够再依次用同义词补。
 
 `video_download` 返回 JSON：`savedTo`（落盘路径）、`bytes`、`backend`（`bilibili` / `ytdlp` / `lux` / `douyin-browser` / `direct`）、`quality`、`title`、`elapsedMs`；失败返回 `{ "error": "...", "message": "..." }`，不会把异常抛到会话里。
 
@@ -35,12 +43,13 @@ video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\
 优先级：
 
 1. 工具参数 `outPath`
-2. 环境变量 `DSH_VIDEO_DOWNLOAD_DIR`
-3. 默认 `~/Downloads/dsh-video-downloader/`
+2. 没给 `outPath` → `<爬取根>\<平台中文名>\`（**按平台分目录**，与关键词爬取同一套口径）
 
-`outPath` 传**目录**（已存在的目录，或以 `/`、`\` 结尾）时，按视频标题自动命名并**直接写进该目录**，不再先落默认目录再搬；传文件名时按该名保存（扩展名自动补 `.mp4`）。
+爬取根默认 `D:\500 工作\视频爬取`，设置页可改，或用 `DSH_CRAWL_ROOT`；平台目录名走别名表（`kuaishou`→快手 / `bilibili`→B站 / `youtube`→YouTube / `douyin`→抖音 / `xiaohongshu`→小红书 / 其他→其他）。
 
-文件名取自视频标题（B 站额外带 BV 号），已过滤 Windows 非法字符并限长。
+`outPath` 传**目录**（已存在的目录，或以 `/`、`\` 结尾）时，按视频标题自动命名并**直接写进该目录**；传文件名时按该名保存（扩展名自动补 `.mp4`）；传相对路径时以「默认下载目录」（`DSH_VIDEO_DOWNLOAD_DIR` → `~/Downloads/dsh-video-downloader/`）为基准。
+
+文件名取自视频标题（B 站额外带 BV 号，快手带视频 id），已过滤 Windows 非法字符并限长。
 
 ## 外部依赖
 
@@ -92,6 +101,26 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 找不到时不会静默失败：音视频分别落盘，返回值里 `muxed: false` 并给出合并命令；只有单条流的站点不需要 ffmpeg。
 
+## 关键词爬取（快手）
+
+`video_crawl { "keyword": "和田大枣", "limit": 50 }` → 后台任务，落盘 `<爬取根>\快手\和田大枣\`。
+
+**怎么拿数据**：快手网页端的搜索接口要一个叫 `__NS_hxfalcon` 的签名，签名必须由页面自己的 JS 现算（绑定请求体 + 时间窗口），所以插件起一个**有头 Edge + 持久 profile**，用 `Page.addScriptToEvaluateOnNewDocument` 在页面脚本之前劫持 `Object.prototype.caver` 的 setter，抓住同时带 `$encode` 与 `$getCatVersion` 的那个对象，再在页面里 `call('$encode', ...)` 生成签名，然后**在页面内** `fetch('/rest/v/search/feed?__NS_hxfalcon=<sign>&caver=2')`。每页 20 条，`pcursor` 递增翻页。
+
+**为什么不用 yt-dlp / lux**：两者都只能吃单链接，不认关键词；而且快手的 `photo.manifest.adaptationSet[].representation[].url` 是现成的单文件 mp4 直链（免 Cookie 免签名，Node 侧 Range 请求实测 206），所以下载这条链路不依赖 ffmpeg、也不需要合并分片。
+
+**登录态**：首次跑会自动打开浏览器，`needHuman.qrPath` 给出二维码截图路径，你在手机上扫码确认后任务自动继续（最多等 3 分钟）。cookie 存在 `<DSH_HOME>\video-downloader\kuaishou\profile\`（Edge 的持久 profile），后续任务直接复用，不用重复扫码。
+
+**下载前筛选**：`maxAgeDays` / `minLike` / `minView` 三个条件在**搜索阶段**就过滤，不达标的直接丢，不下载、不占磁盘。快手没有单独的点赞——「喜欢」就是点赞，`likeCount` 取不到时按 `realLikeCount` / `likedCount` / `like` 依次回退。
+
+**去重与增量**：唯一键是「平台 + 视频 id」，命中索引且文件还在盘才跳过，所以同一个关键词重复跑是增量，不会重复下载。索引在 `<DSH_HOME>\video-downloader\index.jsonl`，任务状态在 `...\crawl\<jobId>.json`。
+
+**限速**：搜索串行、页间隔默认 1.5 秒 + 0–1.5 秒抖动（`DSH_KS_PAGE_DELAY_MS` 可调），下载并发 2；限流（`result:2`）退避重试，连续 3 次就停下。
+
+**遇到验证码 / 风控**：立刻**暂停任务**（`status: paused_need_human`），把当时的页面截图存到 `<DSH_HOME>\video-downloader\kuaishou\pause-<jobId>.png`，在 `needHuman` 里带上是登录失效、验证码还是被拦。你人工处理完用 `video_crawl_resume` 续跑，从已下载的条目之后继续。
+
+**已知限制**：安全 cookie（`kwscode` / `kwssectoken`）大约 6 分钟轮换一次，所以登录态是靠持久 profile 里的浏览器会话维持的，不是靠抓一段 cookie 复制走；快手改签名算法就得跟着改（劫持点只有一个，改起来集中）。任务只在 DSH 进程活着时跑，进程重启后未完成的任务要手动 `video_crawl_resume`。
+
 ## 抖音通路
 
 抖音的详情接口要 UIFID 与签名，yt-dlp 无 Cookie 时直接 403。插件改走**本机无头浏览器**：
@@ -132,9 +161,13 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | yt-dlp 路径 | 空 | 同上 |
 | lux 路径 | 空 | 空 = 自动探测（`DSH_LUX_PATH` → `PATH` → `GOBIN` → `~/go/bin`）；只在 yt-dlp 干不了时被调用 |
 | 通用后端顺序 | `auto` | `auto` = yt-dlp 优先、lux 兜底（推荐）/ `ytdlp` = 只用 yt-dlp / `lux` = lux 优先、yt-dlp 兜底。抖音固定不用 lux |
-| yt-dlp 代理 | 空 | 只作用于非 B 站站点（yt-dlp 与 lux 共用）；B 站 一律直连（抖音也强制直连） |
+| yt-dlp 代理 | 空 | 只作用于非 B 站站点（yt-dlp 与 lux 共用）；B 站 一律直连（抖音也强制直连）。关键词爬取也直连，不走这个代理 |
+| 爬取根目录 | 空 | 空 = `D:\500 工作\视频爬取`；单链接下载（未给 `outPath` 时）与关键词爬取都落在这下面，保存时自动创建 |
+| 最近 N 天 | 空 | 空或 0 = 不限；只下载发布时间在最近 N 天内的（没有发布时间的数据在设了这个条件时算不合格） |
+| 最低点赞 | 空 | 空或 0 = 不限；快手的「喜欢」就是点赞 |
+| 最低播放量 | 空 | 空或 0 = 不限 |
 
-优先级：**单次工具调用的显式传参 > 设置页 > 环境变量 > 内置默认**。环境变量（`DSH_VIDEO_DOWNLOAD_DIR` / `DSH_BILI_CREDENTIAL` / `DSH_FFMPEG_PATH` / `DSH_YTDLP_PATH` / `DSH_YTDLP_PROXY` / `DSH_LUX_PATH` / `DSH_LUX_PROXY` / `DSH_GENERIC_BACKEND`）仍可用，但设置页里填了就以设置页为准。
+优先级：**单次工具调用的显式传参 > 设置页 > 环境变量 > 内置默认**。环境变量（`DSH_VIDEO_DOWNLOAD_DIR` / `DSH_BILI_CREDENTIAL` / `DSH_FFMPEG_PATH` / `DSH_YTDLP_PATH` / `DSH_YTDLP_PROXY` / `DSH_LUX_PATH` / `DSH_LUX_PROXY` / `DSH_GENERIC_BACKEND` / `DSH_CRAWL_ROOT` / `DSH_KS_PAGE_DELAY_MS`）仍可用，但设置页里填了就以设置页为准。
 
 这一页的存盘位置是 `$DSH_HOME/video-downloader/config.json`（只存你改过的键，删掉某个键就等于回到「没设」）。DSH 自带的「内置插件」里那份同一组字段的表单仍保留，两个入口写的是同一套值，谁后设谁生效。
 
@@ -146,6 +179,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - **抖音**：`/video/<id>`、个人页 `?modal_id=<id>`、`v.douyin.com/<码>` 短链、整段分享文本（含短链）、裸的 19 位 id 都认；走本地浏览器通路，默认不需要 Cookie、不需要登录，公开作品即可下。直播、会员、私密作品不处理。
 - **直链媒体**：mp4 / m4s / webm / mkv / flv / ts 按扩展名与 Content-Type 判定，原生下载；m3u8 / mpd 是播放列表不是媒体本身，交给 yt-dlp 拉流合并，不再当成视频文件直接存盘。
 - **其他站点**：交给通用后端——yt-dlp 优先、lux 兜底，覆盖两者支持的站点（小红书、YouTube、Vimeo、快手、腾讯视频、好看视频等）。lux 的增量价值就是那几个 yt-dlp 没有的国内站；两边都有时仍由 yt-dlp 出手（适配与维护更好）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
+- **快手（关键词爬取）**：按关键词批量抓，落 `<根>\快手\<关键词>\`。走本地浏览器拿签名 + 网页搜索接口翻页 + CDN 直链下载，不需要 yt-dlp / lux / ffmpeg。首次要扫码登录一次，cookie 由持久 profile 维持；直播、私密作品、需要付费的内容不处理。遇到验证码会被拦下等你人工处理，不会硬闯。
 - **不做**：DRM 内容、付费墙绕过。
 
 ## 安装
@@ -187,7 +221,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、四个工具的注册与错误分支。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重，以及八个工具的注册与错误分支。当前 41 个用例。
 
 ## 许可证
 

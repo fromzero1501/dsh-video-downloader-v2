@@ -34,6 +34,20 @@ import {
   sanitizeName,
   setEnvInsensitive,
 } from '../src/index.js'
+import {
+  indexHit,
+  loadCrawlIndex,
+  normalizeCrawlFilters,
+  passesCrawlFilter,
+  platformLabel,
+  safeDirName,
+} from '../src/crawl.js'
+import {
+  kuaishouFeeds,
+  kuaishouFileName,
+  kuaishouPickSource,
+  kuaishouVerdict,
+} from '../src/kuaishou.js'
 
 // Minimal ctx: enough for `apply` to register tools and for the pure tools to run.
 function mockCtx() {
@@ -160,16 +174,33 @@ test('sanitizeName strips filesystem-hostile characters and caps length', () => 
   assert.ok(sanitizeName('x'.repeat(200)).length <= 80)
 })
 
-test('apply registers the four tools with valid JSON-Schema parameters', () => {
+test('apply registers every tool with valid JSON-Schema parameters', () => {
   const ctx = mockCtx()
   apply(ctx)
   const names = ctx.all.map((t) => t.name).sort()
-  assert.deepEqual(names, ['video_analyze', 'video_download', 'video_quality_parse', 'video_resolve'])
+  assert.deepEqual(names, [
+    'video_analyze',
+    'video_crawl',
+    'video_crawl_cancel',
+    'video_crawl_resume',
+    'video_crawl_status',
+    'video_download',
+    'video_quality_parse',
+    'video_resolve',
+  ])
+  // 下载类工具必填 url；爬取类必填 keyword / jobId（status 全可选）
+  const requiredByTool = {
+    video_crawl: ['keyword'],
+    video_crawl_cancel: ['jobId'],
+    video_crawl_resume: ['jobId'],
+    video_crawl_status: [],
+  }
   for (const t of ctx.all) {
+    const required = requiredByTool[t.name] || ['url']
     assert.equal(typeof t.description, 'string')
     assert.equal(t.parameters.type, 'object')
-    assert.deepEqual(t.parameters.required, ['url'])
-    assert.equal(t.parameters.properties.url.type, 'string')
+    assert.deepEqual(t.parameters.required || [], required)
+    for (const key of required) assert.equal(t.parameters.properties[key].type, 'string')
     assert.equal(t.parameters.additionalProperties, undefined)
     assert.equal(t.output.schema.type, 'string')
     assert.equal(typeof t.output.render, 'function')
@@ -402,6 +433,120 @@ test('pickLuxOutput only accepts files this run wrote, and prefers the exact bas
 
     // 没有 since 限制时也优先精确同名（体积/时间更大的那条优先）
     assert.equal(pickLuxOutput(dir, 'demo'), fresh)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('platformLabel and safeDirName keep Chinese but strip illegal characters', () => {
+  assert.equal(platformLabel('kuaishou'), '快手')
+  assert.equal(platformLabel('BILIBILI'), 'B站')
+  assert.equal(platformLabel('douyin'), '抖音')
+  assert.equal(platformLabel('something'), 'something')
+  assert.equal(safeDirName('和田大枣'), '和田大枣')
+  assert.equal(safeDirName('a/b:c*d?"e"<f>|g'), 'a b c d e f g')
+  assert.equal(safeDirName('   '), '未命名')
+  assert.equal(safeDirName('name.'), 'name')
+})
+
+test('kuaishouVerdict maps the result codes we actually hit', () => {
+  assert.equal(kuaishouVerdict(1).kind, 'ok')
+  assert.equal(kuaishouVerdict(2).kind, 'rate_limited')
+  assert.equal(kuaishouVerdict(50).kind, 'need_login')
+  assert.equal(kuaishouVerdict(109).kind, 'need_login')
+  assert.equal(kuaishouVerdict(400002).kind, 'captcha')
+  assert.equal(kuaishouVerdict('abc').kind, 'failed')
+  assert.match(kuaishouVerdict(2, '操作太快了').message, /操作太快了/)
+})
+
+test('kuaishouPickSource takes the largest representation and keeps backups', () => {
+  const photo = {
+    manifest: {
+      adaptationSet: [
+        { representation: [{ url: 'https://cdn/low.mp4', size: 100, backupUrl: ['https://cdn/low-b.mp4'] }] },
+        { representation: [
+          { url: 'https://cdn/high.mp4', size: 900, width: 720, height: 1280, codecs: 'avc1' },
+          { url: 'not-a-url', size: 5000 },
+        ] },
+      ],
+    },
+  }
+  const src = kuaishouPickSource(photo)
+  assert.equal(src.url, 'https://cdn/high.mp4')
+  assert.equal(src.size, 900)
+  assert.equal(src.height, 1280)
+  assert.deepEqual(src.backupUrl, [])
+  assert.equal(kuaishouPickSource({}), null)
+  assert.equal(kuaishouPickSource({ manifest: { adaptationSet: [] } }), null)
+})
+
+test('kuaishouFeeds normalises like/view/timestamp and falls back to realLikeCount', () => {
+  const rows = kuaishouFeeds({
+    result: 1,
+    feeds: [
+      {
+        photo: {
+          id: 'aaa', caption: '#和田大枣 好枣', duration: 8966, viewCount: 85132, likeCount: 410,
+          timestamp: 1791652700711,
+          manifest: { adaptationSet: [{ representation: [{ url: 'https://cdn/x.mp4', size: 10 }] }] },
+        },
+        author: { name: '小飞家' },
+      },
+      { photo: { id: 'bbb', caption: 'x', viewCount: 10, realLikeCount: 7, timestamp: 1791652700 } },
+      { photo: { caption: 'no id' } },
+    ],
+  })
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].likeCount, 410)
+  assert.equal(rows[0].viewCount, 85132)
+  assert.equal(rows[0].timestampMs, 1791652700711)
+  assert.equal(rows[0].author, '小飞家')
+  assert.equal(rows[0].source.url, 'https://cdn/x.mp4')
+  assert.equal(rows[1].likeCount, 7)
+  assert.equal(rows[1].timestampMs, 1791652700000)
+  assert.equal(rows[1].source, null)
+})
+
+test('kuaishouFileName drops hashtags and illegal characters', () => {
+  const name = kuaishouFileName('#和田大枣 #助农 好枣/真甜', 'aaa')
+  assert.match(name, /^和田大枣 助农 好枣 真甜 \[aaa\]\.mp4$/)
+  assert.match(kuaishouFileName('', 'bbb'), /^kuaishou \[bbb\]\.mp4$/)
+  assert.ok(kuaishouFileName('x'.repeat(200), 'ccc').length < 80)
+})
+
+test('passesCrawlFilter honours minLike / minView / maxAgeDays', () => {
+  const row = { likeCount: 410, viewCount: 85132, timestampMs: 1791652700711 }
+  assert.equal(passesCrawlFilter(row), true)
+  assert.equal(passesCrawlFilter(row, { minLike: 500 }), false)
+  assert.equal(passesCrawlFilter(row, { minLike: 400 }), true)
+  assert.equal(passesCrawlFilter(row, { minView: 90000 }), false)
+  assert.equal(passesCrawlFilter(row, { maxAgeDays: 30, now: 1791652700711 + 29 * 86400000 }), true)
+  assert.equal(passesCrawlFilter(row, { maxAgeDays: 30, now: 1791652700711 + 31 * 86400000 }), false)
+  // 没有发布时间的数据，在设了时间筛选时算不合格
+  assert.equal(passesCrawlFilter({ likeCount: 1, viewCount: 1 }, { maxAgeDays: 7 }), false)
+
+  assert.deepEqual(normalizeCrawlFilters({ minLike: '', minView: 'abc', maxAgeDays: '7' }), { minLike: 0, minView: 0, maxAgeDays: 7 })
+  assert.deepEqual(normalizeCrawlFilters({ minLike: '-3' }), { minLike: 0, minView: 0, maxAgeDays: 0 })
+})
+
+test('crawl index remembers hits but misses when the file is gone', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vd-crawl-'))
+  try {
+    const file = join(dir, 'keep.mp4')
+    writeFileSync(file, 'bytes')
+    const indexPath = join(dir, 'index.jsonl')
+    writeFileSync(indexPath, [
+      JSON.stringify({ platform: 'kuaishou', id: 'aaa', file, bytes: 5 }),
+      'not json at all',
+      JSON.stringify({ platform: 'kuaishou', id: 'bbb', file: join(dir, 'gone.mp4'), bytes: 5 }),
+    ].join('\n'))
+
+    const index = loadCrawlIndex(indexPath)
+    assert.equal(index.size, 2)
+    assert.equal(indexHit(index, 'kuaishou', 'aaa').file, file)
+    assert.equal(indexHit(index, 'kuaishou', 'bbb'), null)
+    assert.equal(indexHit(index, 'kuaishou', 'nope'), null)
+    assert.equal(loadCrawlIndex(join(dir, 'missing.jsonl')).size, 0)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

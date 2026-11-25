@@ -28,6 +28,7 @@ import { createServer } from 'node:net'
 import { Readable } from 'node:stream'
 import { homedir, tmpdir } from 'node:os'
 import { loadSchemastery } from './hostdeps.js'
+import { createCrawler, normalizeCrawlFilters, platformLabel } from './crawl.js'
 
 export const name = 'dsh-video-downloader'
 export const inject = ['tools']
@@ -45,6 +46,26 @@ export const Config = !z
         .string()
         .default('')
         .description('默认下载目录；留空 = 系统 Downloads\\dsh-video-downloader')
+        .extra('volatile', true),
+      crawlRoot: z
+        .string()
+        .default('')
+        .description('关键词爬取的根目录；留空 = D:\\500 工作\\视频爬取（按 <根>\\<平台>\\<关键词> 分层）')
+        .extra('volatile', true),
+      crawlMaxAgeDays: z
+        .string()
+        .default('')
+        .description('爬取筛选：只要最近 N 天内发布的视频（留空或 0 = 不限时间）')
+        .extra('volatile', true),
+      crawlMinLike: z
+        .string()
+        .default('')
+        .description('爬取筛选：最低点赞（=喜欢）数，低于它的不下载（留空或 0 = 不限）')
+        .extra('volatile', true),
+      crawlMinView: z
+        .string()
+        .default('')
+        .description('爬取筛选：最低播放量，低于它的不下载（留空或 0 = 不限）')
         .extra('volatile', true),
       defaultQuality: z
         .string()
@@ -98,6 +119,10 @@ export function setPanelConfig(config) {
 /** 可配置项与类型（设置页、路由、校验共用一张表）。 */
 const CONFIG_KEYS = {
   downloadDir: 'string',
+  crawlRoot: 'string',
+  crawlMaxAgeDays: 'string',
+  crawlMinLike: 'string',
+  crawlMinView: 'string',
   defaultQuality: 'string',
   biliUseCredential: 'boolean',
   biliCredentialPath: 'string',
@@ -111,6 +136,10 @@ const CONFIG_KEYS = {
 /** 每项的内置默认值（设置页读不到时的兜底，必须与 Config 的 .default() 保持一致）。 */
 const CONFIG_DEFAULTS = {
   downloadDir: '',
+  crawlRoot: '',
+  crawlMaxAgeDays: '',
+  crawlMinLike: '',
+  crawlMinView: '',
   defaultQuality: 'best',
   biliUseCredential: true,
   biliCredentialPath: '',
@@ -659,6 +688,23 @@ export function defaultDownloadDir() {
 }
 
 /**
+ * 爬取根目录：面板设置 → 环境变量 → 本机默认位置。
+ * 关键词爬取与「未显式指定 outPath 的单链接下载」都落在这下面。
+ */
+export function defaultCrawlRoot() {
+  const fromPanel = panelStr('crawlRoot')
+  if (fromPanel) return resolve(fromPanel)
+  const env = process.env.DSH_CRAWL_ROOT
+  if (env && env.trim()) return resolve(env.trim())
+  return resolve('D:\\500 工作\\视频爬取')
+}
+
+/** 单链接下载的默认落点：<爬取根>\<平台中文名>。 */
+export function platformRootOf(url) {
+  return join(defaultCrawlRoot(), platformLabel(detectSite(url)))
+}
+
+/**
  * outPath 指的是「一个目录」而不是文件名时返回该目录，否则返回 null。
  * 判定：末尾带路径分隔符，或者本来就是一个存在的目录。这样传目录就能让插件自己用标题命名。
  */
@@ -676,7 +722,8 @@ function resolveOutPath(url, ext, outPath) {
   if (outDir) return join(outDir, defaultFileName(url, ext))
   if (outPath && isAbsolute(outPath)) return outPath
   if (outPath) return resolve(defaultDownloadDir(), outPath)
-  return join(defaultDownloadDir(), defaultFileName(url, ext))
+  // 没指定落点：按平台分目录（<爬取根>\<平台中文名>），与关键词爬取同一套口径。
+  return join(platformRootOf(url), defaultFileName(url, ext))
 }
 
 function refererHeader(url) {
@@ -1112,7 +1159,7 @@ function muxTracks(ffmpeg, videoPath, audioPath, outPath, signal) {
 export async function downloadBilibili(input, { outPath, signal, quality = 'best', idleMs } = {}) {
   const info = await resolveBilibili(input, { signal, quality })
   const outDir = outDirOf(outPath)
-  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir())
+  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : platformRootOf(input))
   mkdirSync(dir, { recursive: true })
 
   const base = outDir
@@ -1328,7 +1375,7 @@ export async function downloadWithYtDlp(input, { outPath, cookies, signal, quali
     throw err
   }
   const outDir = outDirOf(outPath)
-  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir())
+  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : platformRootOf(input))
   mkdirSync(dir, { recursive: true })
   const template = outDir
     ? join(outDir, '%(title).80s [%(id)s].%(ext)s')
@@ -1667,7 +1714,7 @@ export async function downloadWithLux(input, { outPath, cookies, quality = 'best
     throw err
   }
   const outDir = outDirOf(outPath)
-  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir())
+  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : platformRootOf(input))
   mkdirSync(dir, { recursive: true })
   const baseFromName = outPath && isAbsolute(outPath) && !outDir ? basename(outPath).replace(/\.[a-z0-9]{1,5}$/i, '') : ''
   const base = String((baseFromName || sanitizeName(info.title || 'video') || 'video')).slice(0, 80)
@@ -2186,7 +2233,7 @@ export async function downloadDouyin(input, { outPath, signal, idleMs } = {}) {
     ? join(outDir, `${stem}${id ? `_${id}` : ''}.mp4`)
     : outPath && isAbsolute(outPath)
       ? `${outPath.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp4`
-      : join(defaultDownloadDir(), `${stem}${id ? `_${id}` : ''}.mp4`)
+      : join(platformRootOf('https://www.douyin.com/'), `${stem}${id ? `_${id}` : ''}.mp4`)
   const { filePath, bytes } = await downloadMedia(resolved.mediaUrl, {
     outPath: target,
     headers: { Referer: 'https://www.douyin.com/' },
@@ -2299,6 +2346,8 @@ async function settingsSnapshot({ probe = false } = {}) {
     genericBackend: String(values.genericBackend || 'auto'),
     genericOrder: genericBackendOrder(values.genericBackend),
     downloadDir: defaultDownloadDir(),
+    crawlRoot: defaultCrawlRoot(),
+    crawlFilters: normalizeCrawlFilters(currentCrawlFilters()),
     credential: found,
     loggedIn: null,
   }
@@ -2337,6 +2386,18 @@ function applySettingsPatch(patch) {
         } catch {
           warnings.push('下载目录建不出来（可能没权限）：' + text)
         }
+      }
+      if (key === 'crawlRoot' && text) {
+        try {
+          mkdirSync(resolve(text), { recursive: true })
+        } catch {
+          warnings.push('爬取根目录建不出来（可能没权限）：' + text)
+        }
+      }
+      if (['crawlMaxAgeDays', 'crawlMinLike', 'crawlMinView'].includes(key) && text) {
+        const n = Number(text)
+        if (!Number.isFinite(n) || n < 0) throw new Error(`${key} 需要一个 ≥ 0 的数字`)
+        warnings.push(`${key} = ${n}（0 表示不限）`)
       }
     }
   }
@@ -2481,6 +2542,31 @@ function registerSettingsRoute(ctx) {
 const renderText = (_args, value) => [{ type: 'text', text: value }]
 
 const OUTPUT = { schema: { type: 'string' }, render: renderText }
+
+// ---------------------------------------------------------------- 关键词爬取
+
+let crawlerInstance = null
+
+/** 设置页里的三个筛选值，空串表示不限。 */
+function currentCrawlFilters() {
+  return {
+    maxAgeDays: panelStr('crawlMaxAgeDays'),
+    minLike: panelStr('crawlMinLike'),
+    minView: panelStr('crawlMinView'),
+  }
+}
+
+/** 爬取管理器单例（浏览器 profile、任务状态目录都在 stateDir 下）。 */
+function crawlerOf() {
+  if (!crawlerInstance) {
+    crawlerInstance = createCrawler({
+      stateDir: stateDirOf(),
+      defaultRoot: defaultCrawlRoot(),
+      platform: 'kuaishou',
+    })
+  }
+  return crawlerInstance
+}
 
 export function apply(ctx, config) {
   // 设置页的值就挂在 fiber.config 上；volatile 字段改动会就地改它，所以这里只存引用。
@@ -2682,5 +2768,104 @@ export function apply(ctx, config) {
   }))
 
   // 左侧栏「视频下载」那一页的后端接口（没有 HTTP 面时安静跳过）
+  ctx.tools.register(defineTool({
+    name: 'video_crawl',
+    description:
+      '按关键词批量爬取快手视频（异步任务，立刻返回 jobId）。落盘口径：<根>\\快手\\<用户输入的关键词>\\<标题 [视频id].mp4，' +
+      '根目录默认 D:\\500 工作\\视频爬取（设置页可改）。抓取前会按「最近 N 天发布 / 最低点赞（=喜欢）/ 最低播放量」筛选，' +
+      '不达标的直接跳过不下载；筛选值未传时用设置页里的默认值。' +
+      '搜索策略：先把同一个关键词翻页到底，条数还不够再用 synonyms 里的同义词逐个搜（同义词由调用方生成）。' +
+      '去重键是「平台+videoid」，索引里已有且文件还在盘的跳过，所以重复跑是增量。' +
+      '遇到限流会退避重试；遇到验证码/风控会暂停任务并在 needHuman 里给出截图路径，等你人工处理后用 video_crawl_resume 续跑。' +
+      '返回 { ok, jobId, dir, status, limit, filters, indexPath }。',
+    parameters: {
+      keyword: { type: 'string', required: true, description: '搜索关键词，同时作为落盘子目录名。' },
+      limit: { type: 'number', description: '要下载多少条；不填默认 10 条。' },
+      maxPages: { type: 'number', description: '每个关键词最多翻多少页（每页 20 条）；不填默认 10。' },
+      synonyms: { type: 'array', items: { type: 'string' }, description: '可选：同义词/扩展词列表，主关键词搜不够 limit 时依次补搜。' },
+      root: { type: 'string', description: '可选：覆盖爬取根目录。' },
+      minLike: { type: 'number', description: '可选：最低点赞（=喜欢）数，覆盖设置页默认值。' },
+      minView: { type: 'number', description: '可选：最低播放量，覆盖设置页默认值。' },
+      maxAgeDays: { type: 'number', description: '可选：只要最近 N 天内发布的，覆盖设置页默认值。' },
+    },
+    output: OUTPUT,
+    async execute(args) {
+      try {
+        const crawler = crawlerOf()
+        const filters = currentCrawlFilters()
+        for (const key of ['minLike', 'minView', 'maxAgeDays']) {
+          if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') filters[key] = args[key]
+        }
+        const job = crawler.start({
+          keyword: args.keyword,
+          limit: args.limit,
+          maxPages: args.maxPages,
+          synonyms: args.synonyms,
+          root: args.root,
+          filters,
+        })
+        return JSON.stringify({
+          ok: true,
+          jobId: job.id,
+          dir: job.dir,
+          status: job.status,
+          limit: job.limit,
+          filters: job.filters,
+          indexPath: crawler.indexPath,
+          hint: '任务在后台跑；用 video_crawl_status 查进度，video_crawl_cancel 取消。',
+        })
+      } catch (err) {
+        return JSON.stringify({ error: err?.code || 'crawl_failed', message: String(err?.message || err) })
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'video_crawl_status',
+    description:
+      '查关键词爬取任务的进度。给 jobId 返回该任务的 phase/stats/items 与 needHuman（暂停原因、二维码截图路径）；' +
+      '不给 jobId 返回最近 10 个任务的概要。status 取值：queued / searching / waiting_login / downloading / ' +
+      'paused_need_human / done / partial / canceled / failed。',
+    parameters: {
+      jobId: { type: 'string', description: '可选：任务 id（video_crawl 返回的那个）。' },
+    },
+    output: OUTPUT,
+    async execute(args) {
+      const out = crawlerOf().status(args.jobId ? String(args.jobId).trim() : '')
+      if (!out) return JSON.stringify({ error: 'not_found', message: `找不到任务 ${args.jobId}` })
+      return JSON.stringify(out)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'video_crawl_resume',
+    description:
+      '继续一个暂停（paused_need_human / waiting_login）或失败的任务。人工处理完验证码/扫码登录后用。' +
+      '会重新打开浏览器并从索引里已下载的条目之后继续，不会重复下载。',
+    parameters: {
+      jobId: { type: 'string', required: true, description: '要续跑的任务 id。' },
+    },
+    output: OUTPUT,
+    async execute(args) {
+      const out = crawlerOf().resume(String(args.jobId).trim())
+      if (!out) return JSON.stringify({ error: 'not_found', message: `找不到任务 ${args.jobId}` })
+      return JSON.stringify(out)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'video_crawl_cancel',
+    description: '取消一个正在跑或暂停的爬取任务（已下载的文件保留）。',
+    parameters: {
+      jobId: { type: 'string', required: true, description: '要取消的任务 id。' },
+    },
+    output: OUTPUT,
+    async execute(args) {
+      const out = crawlerOf().cancel(String(args.jobId).trim())
+      if (!out) return JSON.stringify({ error: 'not_found', message: `找不到任务 ${args.jobId}` })
+      return JSON.stringify(out)
+    },
+  }))
+
   registerSettingsRoute(ctx)
 }
