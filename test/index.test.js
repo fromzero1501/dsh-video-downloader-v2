@@ -56,6 +56,15 @@ import {
 } from '../src/kuaishou.js'
 import { createPlatformRegistry, detectCrawlPlatform } from '../src/platforms/index.js'
 import { BILI_DM_PARAMS, biliRow, cleanBiliTitle, createBilibiliAdapter, wbiSign } from '../src/platforms/bilibili.js'
+import {
+  decodeDouyinPayloads,
+  douyinExtractAwemes,
+  douyinFileName,
+  douyinPageState,
+  douyinResolveCreatorId,
+  douyinRow,
+  douyinVerdict,
+} from '../src/platforms/douyin.js'
 
 // Minimal ctx: enough for `apply` to register tools and for the pure tools to run.
 function mockCtx() {
@@ -675,21 +684,23 @@ test('download watchdog treats stalls and truncation as retryable, 4xx as not', 
   assert.equal(isRetryableDownloadError(''), false)
 })
 
-test('detectCrawlPlatform recognizes bilibili/kuaishou and refuses douyin', () => {
+test('detectCrawlPlatform recognizes bilibili/kuaishou/douyin', () => {
   assert.equal(detectCrawlPlatform('https://www.bilibili.com/video/BV17h4y1r7JT'), 'bilibili')
   assert.equal(detectCrawlPlatform('https://space.bilibili.com/3494363638270349/video'), 'bilibili')
   assert.equal(detectCrawlPlatform('BV17h4y1r7JT'), 'bilibili')
   assert.equal(detectCrawlPlatform('https://b23.tv/abc123'), 'bilibili')
   assert.equal(detectCrawlPlatform('https://www.kuaishou.com/short-video/3xuabp7j6t8mevu'), 'kuaishou')
   assert.equal(detectCrawlPlatform('https://v.kuaishou.com/abc'), 'kuaishou')
-  // 抖音通道还没实现：宁可返回空，也不让调用方以为能用
-  assert.equal(detectCrawlPlatform('https://www.douyin.com/video/7412'), '')
+  assert.equal(detectCrawlPlatform('https://www.douyin.com/user/MS4wLjABAAAAabcd1234'), 'douyin')
+  assert.equal(detectCrawlPlatform('https://www.douyin.com/video/7412'), 'douyin')
+  assert.equal(detectCrawlPlatform('MS4wLjABAAAAabcd1234'), 'douyin')
+  // 裸关键词不该被猜成任何平台
   assert.equal(detectCrawlPlatform('随便一个关键词'), '')
 })
 
 test('platform registry exposes adapters and honors like-filter support', () => {
   const registry = createPlatformRegistry({})
-  assert.deepEqual(registry.ids, ['kuaishou', 'bilibili'])
+  assert.deepEqual(registry.ids, ['kuaishou', 'bilibili', 'douyin'])
   const bili = registry.get('bilibili')
   assert.equal(bili.label, 'B站')
   assert.equal(bili.needsBrowser, false)
@@ -697,6 +708,12 @@ test('platform registry exposes adapters and honors like-filter support', () => 
   assert.equal(bili.supportsLikeFilter('creator'), false)
   assert.equal(bili.supportsLikeFilter('keyword'), true)
   assert.equal(registry.get('unknown'), null)
+  const douyin = registry.get('douyin')
+  assert.equal(douyin.label, '抖音')
+  // 抖音必须走浏览器（安全字段由页面运行时补）
+  assert.equal(douyin.needsBrowser, true)
+  assert.equal(douyin.supportsLikeFilter('creator'), true)
+  assert.equal(douyin.resolveCreatorId('https://www.douyin.com/user/MS4wLjABAAAAxyz').creatorId, 'MS4wLjABAAAAxyz')
   // 纯 HTTP 平台没有浏览器会话
   assert.equal(typeof bili.openSession, 'function')
   assert.equal(bili.resolveCreatorId('https://space.bilibili.com/3494363638270349/video').creatorId, '3494363638270349')
@@ -721,4 +738,73 @@ test('bilibili wbi signing and row mapping keep the fields crawl needs', () => {
   assert.equal(row.durationMs, 592000)
   // 作者主页返回的作品没有 like 字段：保持 undefined，不要补 0（否则会被最低点赞筛掉）
   assert.equal(biliRow({ bvid: 'BV1Ko4izNEvn', title: 't', created: 1760514994, length: '01:26' }, { source: 'creator' }).likeCount, undefined)
+})
+
+test('douyin decode handles chunked frames and plain json', () => {
+  const payload = { status_code: 0, has_more: true, cursor: 20, data: [{ aweme_id: '7412', desc: '大枣', video: { play_addr: { url_list: ['https://cdn/1.mp4'] }, duration: 15000 } }] }
+  const chunk = Buffer.from(JSON.stringify(payload), 'utf8')
+  const framed = Buffer.concat([
+    Buffer.from(chunk.length.toString(16) + '\r\n', 'latin1'),
+    chunk,
+    Buffer.from('\r\n0\r\n\r\n', 'latin1'),
+  ]).toString('utf8')
+  const decoded = decodeDouyinPayloads(framed)
+  assert.equal(decoded.length, 1)
+  assert.equal(decoded[0].status_code, 0)
+  assert.equal(decodeDouyinPayloads(JSON.stringify(payload)).length, 1)
+  assert.deepEqual(decodeDouyinPayloads(''), [])
+  // 半截帧不能崩，也不能凭空造出对象
+  assert.deepEqual(decodeDouyinPayloads('ff\r\n{"a":1}'), [])
+})
+
+test('douyin verdict separates login, captcha, rate limit and reject', () => {
+  assert.equal(douyinVerdict({ status_code: 0 }).kind, 'ok')
+  assert.equal(douyinVerdict({ status_code: 2483, status_msg: '请先登录，再继续搜索吧' }).kind, 'need_login')
+  assert.equal(douyinVerdict({ status_code: 8 }).kind, 'need_login')
+  assert.equal(douyinVerdict({ status_code: 2154, status_msg: '请求过于频繁' }).kind, 'rate_limited')
+  assert.equal(douyinVerdict({ status_code: 1000, status_msg: 'captcha verify' }).kind, 'captcha')
+  assert.equal(douyinVerdict({ status_code: 0, search_nil_info: { search_nil_type: 'verify_check' } }).kind, 'captcha')
+  assert.equal(douyinVerdict({ status_code: 12345, status_msg: 'boom' }).kind, 'blocked')
+  assert.equal(douyinVerdict(null).kind, 'failed')
+})
+
+test('douyin row keeps missing stats undefined and picks the direct play url', () => {
+  const row = douyinRow({
+    aweme_id: '7412345678901234567',
+    desc: '新疆大枣 #好吃',
+    create_time: 1760514994,
+    statistics: { digg_count: 1234, play_count: 5678 },
+    video: { duration: 15000, play_addr: { url_list: ['https://v3/cdn/1.mp4', 'https://v3/cdn/backup.mp4'] } },
+    author: { nickname: '枣农', sec_uid: 'MS4wLjABAAAAxz' },
+  })
+  assert.equal(row.id, '7412345678901234567')
+  assert.equal(row.likeCount, 1234)
+  assert.equal(row.viewCount, 5678)
+  assert.equal(row.timestampMs, 1760514994000)
+  assert.equal(row.durationMs, 15000)
+  assert.equal(row.source.url, 'https://v3/cdn/1.mp4')
+  assert.deepEqual(row.source.backupUrl, ['https://v3/cdn/backup.mp4'])
+  assert.equal(row.author, '枣农')
+  // 没有 digg_count 时保持 undefined，绝不补 0
+  const bare = douyinRow({ aweme_id: '2', video: { play_addr: { url_list: [] } } })
+  assert.equal(bare.likeCount, undefined)
+  assert.equal(bare.source.url, '')
+  assert.equal(douyinRow({ desc: 'no id' }), null)
+})
+
+test('douyin helpers: file name, page cursor, creator id', () => {
+  assert.equal(douyinFileName('新疆大枣 #好吃', '7412'), '新疆大枣 好吃 [7412].mp4')
+  assert.equal(douyinFileName('', '7412'), 'douyin [7412].mp4')
+  const st = douyinPageState({ has_more: true, cursor: 20, extra: { logid: 'abc' } })
+  assert.deepEqual(st, { hasMore: true, next: 20, searchId: 'abc' })
+  assert.equal(douyinPageState(null).hasMore, false)
+  assert.equal(douyinResolveCreatorId('https://www.douyin.com/user/MS4wLjABAAAAq').creatorId, 'MS4wLjABAAAAq')
+  assert.equal(douyinResolveCreatorId('MS4wLjABAAAAq').creatorId, 'MS4wLjABAAAAq')
+  assert.equal(douyinResolveCreatorId('https://www.douyin.com/video/7412'), null)
+})
+
+test('douyin extractor walks nested containers without inventing items', () => {
+  const found = douyinExtractAwemes({ data: [{ aweme_info: { aweme_id: '1', video: {} } }, { card: { aweme_id: '2', images: [] } }] })
+  assert.deepEqual(found.map((x) => x.aweme_id), ['1', '2'])
+  assert.deepEqual(douyinExtractAwemes({ data: [{ author: { nickname: 'x' } }] }), [])
 })

@@ -7,8 +7,11 @@
  * 不要自己糊标题栏按钮 + 全屏遮罩（第一版那样做，一眼就跟别的插件不一样）。
  *
  * 这一页只做两件事：
- *   ① 读 `/api/video-downloader/state` —— 9 项当前生效值 + 只读状态（登录态 / ffmpeg / yt-dlp / lux / 落地目录）
+ *   ① 读 `/api/video-downloader/state` —— 当前生效值 + 只读状态（登录态 / ffmpeg / yt-dlp / lux / 落地目录）
  *   ② 写 `/api/video-downloader/config` —— 保存改动，写完回读核对；失败必须红字，不许绿字骗人
+ *
+ * 版式：顶部一条状态带 + 若干可折叠分区。分区头右侧直接显示该项的「现在其实是什么」，
+ * 想改再展开——这样默认状态下一屏就能看完所有当前生效值。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-video-downloader',
@@ -38,73 +41,137 @@ window.__ModuleLoader__.load({
     }))
 
     const QUALITY_OPTIONS = [
-      ['best', 'best —— 跟随账号权限取最高（默认）'],
-      ['worst', 'worst —— 取最低（省流量）'],
-      ['112', '112 —— 1080P 高码率'],
-      ['80', '80 —— 1080P'],
-      ['64', '64 —— 720P'],
-      ['32', '32 —— 480P'],
-      ['16', '16 —— 360P'],
+      ['best', 'best · 跟随账号权限取最高（默认）'],
+      ['worst', 'worst · 取最低（省流量）'],
+      ['112', '112 · 1080P 高码率'],
+      ['80', '80 · 1080P'],
+      ['64', '64 · 720P'],
+      ['32', '32 · 480P'],
+      ['16', '16 · 360P'],
     ]
 
     // 非 B站 站点的后端顺序：auto 是推荐值（lux 站点维护停滞，不该挡在前面）
     const BACKEND_OPTIONS = [
-      ['auto', 'auto —— yt-dlp 优先，lux 兜底（推荐）'],
-      ['ytdlp', 'yt-dlp —— 只用 yt-dlp'],
-      ['lux', 'lux —— lux 优先，yt-dlp 兜底'],
+      ['auto', 'auto · yt-dlp 优先，lux 兜底（推荐）'],
+      ['ytdlp', 'yt-dlp · 只用 yt-dlp'],
+      ['lux', 'lux · lux 优先，yt-dlp 兜底'],
+    ]
+
+    // 批量爬取平台：只有实现了适配器的才在这里出现
+    const PLATFORM_OPTIONS = [
+      ['kuaishou', '快手'],
+      ['bilibili', 'B站'],
+      ['douyin', '抖音'],
     ]
 
     const CSS = `
-[data-vd-page]{display:flex;flex-direction:column;gap:14px;padding:4px 2px 24px;font-size:14px;line-height:1.6}
-[data-vd-bar]{position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 0;background:var(--bg-primary,transparent)}
-[data-vd-badge]{border:1px solid rgba(127,127,127,.35);border-radius:999px;padding:1px 10px;font-size:12px;opacity:.9;white-space:nowrap}
-[data-vd-badge][data-on]{border-color:rgba(46,160,67,.6);color:#2ea043}
-[data-vd-badge][data-off]{border-color:rgba(210,90,60,.6);color:#d05a3c}
+[data-vd-page]{display:flex;flex-direction:column;gap:12px;padding:2px 2px 28px;font-size:14px;line-height:1.55}
+[data-vd-top]{position:sticky;top:0;z-index:3;display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 0 10px;background:var(--bg-primary,canvas);border-bottom:1px solid rgba(127,127,127,.16)}
+[data-vd-chip]{display:inline-flex;align-items:center;gap:6px;border:1px solid rgba(127,127,127,.28);border-radius:999px;padding:2px 10px 2px 8px;font-size:12px;opacity:.92;white-space:nowrap;max-width:100%}
+[data-vd-dot]{width:6px;height:6px;border-radius:50%;background:rgba(127,127,127,.65);flex:0 0 auto}
+[data-vd-chip][data-ok] [data-vd-dot]{background:#2ea043}
+[data-vd-chip][data-bad] [data-vd-dot]{background:#d05a3c}
+[data-vd-chip][data-ok]{border-color:rgba(46,160,67,.42)}
+[data-vd-chip][data-bad]{border-color:rgba(210,90,60,.42)}
+[data-vd-chip] [data-vd-mono]{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;opacity:.8;overflow:hidden;text-overflow:ellipsis;max-width:42ch;white-space:nowrap}
 [data-vd-grow]{flex:1 1 auto}
-[data-vd-sec]{display:flex;flex-direction:column;gap:10px;border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:12px 14px}
-[data-vd-h]{font-weight:600;font-size:13px;opacity:.75;letter-spacing:.02em}
-[data-vd-row]{display:flex;align-items:flex-start;gap:12px}
+[data-vd-sec]{border:1px solid rgba(127,127,127,.2);border-radius:12px;overflow:hidden;background:rgba(127,127,127,.028)}
+[data-vd-head]{display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;padding:10px 14px;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer;text-align:left}
+[data-vd-head]:hover{background:rgba(127,127,127,.06)}
+[data-vd-caret]{width:12px;flex:0 0 auto;opacity:.5;font-size:10px;transition:transform .12s ease}
+[data-vd-title]{font-weight:600;font-size:13.5px;letter-spacing:.01em}
+[data-vd-sum]{flex:1 1 auto;min-width:0;font-size:12px;opacity:.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+[data-vd-body]{display:flex;flex-direction:column;gap:14px;padding:2px 14px 14px}
+[data-vd-hint]{font-size:12px;opacity:.6}
+[data-vd-row]{display:grid;grid-template-columns:minmax(0,1fr) minmax(160px,46%);gap:14px;align-items:start}
+[data-vd-col]{display:flex;flex-direction:column;gap:10px}
+[data-vd-filters]{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+[data-vd-filter]{display:flex;flex-direction:column;gap:4px;min-width:0}
 [data-vd-label]{font-weight:500}
-[data-vd-note]{font-size:12px;opacity:.6}
-[data-vd-input]{box-sizing:border-box;width:100%;padding:6px 9px;border:1px solid rgba(127,127,127,.35);border-radius:8px;background:transparent;color:inherit;font-family:inherit;font-size:13px}
-[data-vd-input]:focus{outline:2px solid rgba(80,140,255,.45);outline-offset:1px}
-[data-vd-btn]{padding:4px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px;background:transparent;color:inherit;font-family:inherit;font-size:13px;cursor:pointer}
-[data-vd-btn][data-primary]{border-color:rgba(80,140,255,.65);color:#3b82f6}
-[data-vd-btn]:disabled{opacity:.5;cursor:default}
-[data-vd-msg]{border-radius:8px;padding:6px 10px;font-size:12px;border:1px solid rgba(127,127,127,.35)}
-[data-vd-msg][data-good]{border-color:rgba(46,160,67,.55);color:#2ea043}
-[data-vd-msg][data-warn]{border-color:rgba(210,90,60,.55);color:#d05a3c}
-[data-vd-src]{font-size:11px;opacity:.5}
+[data-vd-note]{font-size:12px;opacity:.58;margin-top:2px}
+[data-vd-src]{font-size:11px;opacity:.42;margin-top:2px}
+[data-vd-input]{box-sizing:border-box;width:100%;padding:7px 10px;border:1px solid rgba(127,127,127,.32);border-radius:9px;background:transparent;color:inherit;font-family:inherit;font-size:13px;transition:border-color .12s ease}
+[data-vd-input]:hover{border-color:rgba(127,127,127,.5)}
+[data-vd-input]:focus{outline:2px solid rgba(80,140,255,.4);outline-offset:0;border-color:rgba(80,140,255,.55)}
+[data-vd-btn]{padding:5px 14px;border:1px solid rgba(127,127,127,.35);border-radius:9px;background:transparent;color:inherit;font-family:inherit;font-size:13px;cursor:pointer;transition:border-color .12s ease,background .12s ease}
+[data-vd-btn]:hover:not(:disabled){background:rgba(127,127,127,.09)}
+[data-vd-btn][data-primary]{border-color:rgba(80,140,255,.6);color:#3b82f6}
+[data-vd-btn][data-primary][data-dirty]{background:rgba(80,140,255,.12)}
+[data-vd-btn]:disabled{opacity:.45;cursor:default}
+[data-vd-msg]{display:flex;gap:8px;align-items:flex-start;border-radius:9px;padding:7px 11px;font-size:12.5px;border:1px solid rgba(127,127,127,.3)}
+[data-vd-msg][data-good]{border-color:rgba(46,160,67,.5);color:#2ea043}
+[data-vd-msg][data-warn]{border-color:rgba(210,90,60,.5);color:#d05a3c}
+[data-vd-switch]{display:inline-flex;align-items:center;gap:8px;padding:5px 12px;border:1px solid rgba(127,127,127,.32);border-radius:999px;background:transparent;color:inherit;font:inherit;font-size:13px;cursor:pointer}
+[data-vd-switch][data-on]{border-color:rgba(46,160,67,.55);color:#2ea043}
+[data-vd-switch][data-on] [data-vd-dot]{background:#2ea043}
+[data-vd-foot]{font-size:12px;opacity:.5;padding:2px 2px 0}
+[data-vd-bad]{font-size:12px;opacity:.62;padding:8px 0}
+@media (max-width:720px){[data-vd-row]{grid-template-columns:minmax(0,1fr)}}
 `
 
-    function Toggle(props) {
-      return h('div', { 'data-vd-row': '' },
-        h('div', { 'data-vd-grow': '' },
-          h('div', { 'data-vd-label': '' }, props.label),
-          props.note ? h('div', { 'data-vd-note': '' }, props.note) : null),
-        h('button', {
-          'data-vd-btn': '',
-          'aria-pressed': props.on ? 'true' : 'false',
-          disabled: props.disabled,
-          onClick: () => props.onChange(!props.on),
-        }, props.on ? '开' : '关'))
+    /** 状态带里的一枚小胶囊。tone: ok | bad | null */
+    function Chip({ tone, children, mono }) {
+      return h('span', { 'data-vd-chip': '', 'data-ok': tone === 'ok' ? '' : undefined, 'data-bad': tone === 'bad' ? '' : undefined },
+        h('i', { 'data-vd-dot': '' }),
+        mono ? h('span', { 'data-vd-mono': '', title: String(children) }, children) : h('span', null, children))
     }
 
-    function Field(props) {
+    /**
+     * 可折叠分区。关闭时用 display:none 保留 DOM，避免展开/收起把输入框里的光标状态弄丢。
+     * sum 是收起状态下也要能看到的「现在其实是什么」。
+     */
+    function Section({ title, sum, open: openInit, children }) {
+      const [open, setOpen] = React.useState(!!openInit)
+      return h('div', { 'data-vd-sec': '' },
+        h('button', { 'data-vd-head': '', type: 'button', onClick: () => setOpen((v) => !v), 'aria-expanded': open ? 'true' : 'false' },
+          h('span', { 'data-vd-caret': '', style: { transform: open ? 'rotate(90deg)' : 'none' } }, '▶'),
+          h('span', { 'data-vd-title': '' }, title),
+          h('span', { 'data-vd-sum': '', title: sum ? String(sum) : '' }, sum || '')),
+        h('div', { 'data-vd-body': '', style: open ? undefined : { display: 'none' } }, children))
+    }
+
+    function Row({ label, note, source, children }) {
       return h('div', { 'data-vd-row': '' },
-        h('div', { 'data-vd-grow': '' },
-          h('div', { 'data-vd-label': '' }, props.label),
-          props.note ? h('div', { 'data-vd-note': '' }, props.note) : null,
-          props.source ? h('div', { 'data-vd-src': '' }, props.source) : null),
-        h('div', { style: { width: '52%', maxWidth: '520px' } },
-          h('input', {
-            'data-vd-input': '',
-            type: 'text',
-            placeholder: props.placeholder || '',
-            value: props.value ?? '',
-            spellcheck: false,
-            onChange: (e) => props.onChange(e.target.value),
-          })))
+        h('div', null,
+          label ? h('div', { 'data-vd-label': '' }, label) : null,
+          note ? h('div', { 'data-vd-note': '' }, note) : null,
+          source ? h('div', { 'data-vd-src': '' }, source) : null),
+        h('div', { style: { minWidth: 0 } }, children))
+    }
+
+    function TextInput({ value, placeholder, onChange }) {
+      return h('input', {
+        'data-vd-input': '',
+        type: 'text',
+        placeholder: placeholder || '',
+        value: value ?? '',
+        spellcheck: false,
+        onChange: (e) => onChange(e.target.value),
+      })
+    }
+
+    function TextField({ label, note, source, value, placeholder, onChange }) {
+      return h(Row, { label, note, source }, h(TextInput, { value, placeholder, onChange }))
+    }
+
+    function SelectField({ label, note, source, value, options, onChange }) {
+      return h(Row, { label, note, source },
+        h('select', {
+          'data-vd-input': '',
+          value: value ?? options[0][0],
+          onChange: (e) => onChange(e.target.value),
+        }, options.map(([v, text]) => h('option', { key: v, value: v }, text))))
+    }
+
+    function SwitchField({ label, note, source, on, onChange }) {
+      return h(Row, { label, note, source },
+        h('button', {
+          'data-vd-switch': '',
+          'data-on': on ? '' : undefined,
+          type: 'button',
+          'aria-pressed': on ? 'true' : 'false',
+          onClick: () => onChange(!on),
+        }, h('i', { 'data-vd-dot': '' }), on ? '开' : '关'))
     }
 
     function Panel() {
@@ -132,6 +199,7 @@ window.__ModuleLoader__.load({
       }, [])
 
       const setKey = (k, v) => { setForm((f) => ({ ...f, [k]: v })); setDirty((d) => ({ ...d, [k]: true })) }
+      const dirtyCount = Object.keys(dirty).length
 
       const save = async () => {
         const patch = {}
@@ -153,35 +221,47 @@ window.__ModuleLoader__.load({
       if (!state) {
         return h('div', { 'data-vd-page': '' },
           msg ? h('div', { 'data-vd-msg': '', 'data-warn': '' }, msg.t) : null,
-          h('div', { 'data-vd-note': '' }, fails >= 3
+          h('div', { 'data-vd-bad': '' }, fails >= 3
             ? '读不到插件配置（已试 ' + fails + ' 次）。常见原因：刚装完没重启 DSH；或插件加载失败（看「插件健康」）。'
             : '读设置中…'))
       }
 
       const st = state.status || {}
       const src = state.sources || {}
-      const srcText = (k) => src[k] === 'local' ? '当前来源：这一页（面板）' : src[k] === 'native' ? '当前来源：DSH 内置插件设置页' : '当前来源：默认值'
+      const srcText = (k) => src[k] === 'local' ? '来源：这一页' : src[k] === 'native' ? '来源：DSH 内置设置页' : '来源：默认值'
+      const platformLabel = (id) => (PLATFORM_OPTIONS.find(([v]) => v === id) || [, id])[1]
+      const crawlRoot = form.crawlRoot || st.crawlRoot || 'D:\\500 工作\\视频爬取'
+      const filters = st.crawlFilters || {}
+      const filterText = [
+        filters.maxAgeDays > 0 ? '最近 ' + filters.maxAgeDays + ' 天' : '不限时间',
+        filters.minLike > 0 ? '点赞 ≥ ' + filters.minLike : '不限点赞',
+        filters.minView > 0 ? '播放 ≥ ' + filters.minView : '不限播放',
+      ].join(' · ')
 
       return h('div', { 'data-vd-page': '' },
-        msg ? h('div', { 'data-vd-msg': '', 'data-good': msg.tone === 'good' ? '' : undefined, 'data-warn': msg.tone === 'warn' ? '' : undefined }, msg.t) : null,
 
-        h('div', { 'data-vd-bar': '' },
-          h('span', { 'data-vd-badge': '', 'data-on': st.loggedIn === true ? '' : undefined, 'data-off': st.loggedIn === false ? '' : undefined },
-            st.loggedIn === true ? 'B站 已登录（清晰度跟账号权限）' : st.loggedIn === false ? 'B站 未登录（最高 480P）' : 'B站 登录态未知'),
-          h('span', { 'data-vd-badge': '', 'data-on': st.ffmpeg ? '' : undefined, 'data-off': st.ffmpeg ? undefined : '' },
-            st.ffmpeg ? 'ffmpeg 就绪' : 'ffmpeg 未找到'),
-          h('span', { 'data-vd-badge': '', 'data-on': st.ytdlp ? '' : undefined },
-            st.ytdlp ? 'yt-dlp 就绪' : 'yt-dlp 未找到'),
-          h('span', { 'data-vd-badge': '', 'data-on': st.lux ? '' : undefined },
-            st.lux ? 'lux 就绪' : 'lux 未找到'),
+        h('div', { 'data-vd-top': '' },
+          h(Chip, { tone: st.ffmpeg ? 'ok' : 'bad' }, st.ffmpeg ? 'ffmpeg 就绪' : 'ffmpeg 未找到'),
+          h(Chip, { tone: st.ytdlp ? 'ok' : null }, st.ytdlp ? 'yt-dlp 就绪' : 'yt-dlp 未找到'),
+          h(Chip, { tone: st.lux ? 'ok' : null }, st.lux ? 'lux 就绪' : 'lux 未找到'),
+          h(Chip, { tone: st.loggedIn === true ? 'ok' : null },
+            st.loggedIn === true ? 'B站 已登录' : st.loggedIn === false ? 'B站 未登录（480P）' : 'B站 登录态未知'),
           h('div', { 'data-vd-grow': '' }),
-          h('button', { 'data-vd-btn': '', 'data-primary': '', disabled: busy, onClick: save },
-            busy ? '保存中…' : '保存'),
+          dirtyCount ? h('span', { 'data-vd-hint': '' }, dirtyCount + ' 项未保存') : null,
+          h('button', {
+            'data-vd-btn': '', 'data-primary': '', 'data-dirty': dirtyCount ? '' : undefined,
+            disabled: busy, onClick: save,
+          }, busy ? '保存中…' : '保存'),
           h('button', { 'data-vd-btn': '', disabled: busy, onClick: () => load(true) }, '重新读取')),
 
-        h('div', { 'data-vd-sec': '' },
-          h('div', { 'data-vd-h': '' }, '下载落点'),
-          h(Field, {
+        msg ? h('div', {
+          'data-vd-msg': '',
+          'data-good': msg.tone === 'good' ? '' : undefined,
+          'data-warn': msg.tone === 'warn' ? '' : undefined,
+        }, msg.t) : null,
+
+        h(Section, { title: '下载落点与清晰度', open: true, sum: (st.downloadDir || '—') + ' · ' + (form.defaultQuality || 'best') },
+          h(TextField, {
             label: '默认下载目录',
             note: '留空 = 系统 Downloads\\dsh-video-downloader；目录不存在会自动创建',
             placeholder: st.downloadDir || '',
@@ -189,133 +269,111 @@ window.__ModuleLoader__.load({
             source: srcText('downloadDir'),
             onChange: (v) => setKey('downloadDir', v),
           }),
-          h('div', { 'data-vd-note': '' }, '现在实际落在：' + (st.downloadDir || '—'))),
+          h(SelectField, {
+            label: '默认清晰度',
+            note: '没有权限的档位会自动降到账号可达的最高档，回报的是实际档位',
+            source: srcText('defaultQuality'),
+            value: form.defaultQuality,
+            options: QUALITY_OPTIONS,
+            onChange: (v) => setKey('defaultQuality', v),
+          })),
 
-        h('div', { 'data-vd-sec': '' },
-          h('div', { 'data-vd-h': '' }, '关键词爬取（快手）'),
-          h(Field, {
+        h(Section, { title: '批量爬取', open: true, sum: platformLabel(form.crawlPlatform || 'kuaishou') + ' · ' + filterText },
+          h(SelectField, {
+            label: '平台',
+            note: '关键词批量与作者主页批量都按这里的平台走；单次任务也可以用 video_crawl 的 platform 参数指定',
+            source: srcText('crawlPlatform'),
+            value: form.crawlPlatform,
+            options: PLATFORM_OPTIONS,
+            onChange: (v) => setKey('crawlPlatform', v),
+          }),
+          h(TextField, {
             label: '爬取根目录',
-            note: '落盘口径：<根>\\快手\\<关键词>\\<标题 [视频id].mp4；留空 = D:\\500 工作\\视频爬取',
-            placeholder: st.crawlRoot || '',
+            note: '落盘口径：<根>\\<平台>\\<关键词或作者名>\\<文件名>',
+            placeholder: crawlRoot,
             value: form.crawlRoot,
             source: srcText('crawlRoot'),
             onChange: (v) => setKey('crawlRoot', v),
           }),
-          h('div', { 'data-vd-row': '' },
-            h('div', { style: { flex: '1 1 0', minWidth: '150px' } }, h(Field, {
-              label: '最近 N 天',
-              note: '留空或 0 = 不限',
-              placeholder: '不限',
-              value: form.crawlMaxAgeDays,
-              source: srcText('crawlMaxAgeDays'),
-              onChange: (v) => setKey('crawlMaxAgeDays', v),
-            })),
-            h('div', { style: { flex: '1 1 0', minWidth: '150px' } }, h(Field, {
-              label: '最低点赞',
-              note: '快手的「喜欢」就是点赞',
-              placeholder: '不限',
-              value: form.crawlMinLike,
-              source: srcText('crawlMinLike'),
-              onChange: (v) => setKey('crawlMinLike', v),
-            })),
-            h('div', { style: { flex: '1 1 0', minWidth: '150px' } }, h(Field, {
-              label: '最低播放量',
-              note: '留空或 0 = 不限',
-              placeholder: '不限',
-              value: form.crawlMinView,
-              source: srcText('crawlMinView'),
-              onChange: (v) => setKey('crawlMinView', v),
-            }))),
-          h('div', { 'data-vd-note': '' },
-            '这三项在下载前筛选：搜索阶段就把不达标的丢掉，不下载、不占磁盘；单次任务可以用 video_crawl 的 minLike / minView / maxAgeDays 临时覆盖。')),
+          h('div', { 'data-vd-hint': '' }, '下载前筛选：不达标的在搜索阶段就丢掉，不下载、不占磁盘'),
+          h('div', { 'data-vd-filters': '' },
+            ...[
+              ['最近 N 天', '留空或 0 = 不限', 'crawlMaxAgeDays', '不限'],
+              ['最低点赞', '快手的「喜欢」等价于点赞', 'crawlMinLike', '不限'],
+              ['最低播放量', '留空或 0 = 不限', 'crawlMinView', '不限'],
+            ].map(([label, note, key, ph]) => h('div', { key, 'data-vd-filter': '' },
+              h('div', { 'data-vd-label': '' }, label),
+              h(TextInput, { placeholder: ph, value: form[key], onChange: (v) => setKey(key, v) }),
+              h('div', { 'data-vd-note': '' }, note))))),
 
-        h('div', { 'data-vd-sec': '' },
-          h('div', { 'data-vd-h': '' }, '清晰度'),
-          h('div', { 'data-vd-row': '' },
-            h('div', { 'data-vd-grow': '' },
-              h('div', { 'data-vd-label': '' }, '默认清晰度偏好'),
-              h('div', { 'data-vd-note': '' }, '没有权限的档位会自动降到账号可达的最高档，回报的是实际档位'),
-              h('div', { 'data-vd-src': '' }, srcText('defaultQuality'))),
-            h('div', { style: { width: '52%', maxWidth: '520px' } },
-              h('select', {
-                'data-vd-input': '',
-                value: form.defaultQuality || 'best',
-                onChange: (e) => setKey('defaultQuality', e.target.value),
-              }, QUALITY_OPTIONS.map(([v, label]) => h('option', { key: v, value: v }, label)))))),
-
-        h('div', { 'data-vd-sec': '' },
-          h('div', { 'data-vd-h': '' }, 'B站 登录态'),
-          h(Toggle, {
+        h(Section, { title: '账号', sum: st.credential ? 'B站 凭证已找到' : 'B站 凭证未找到（匿名 480P）' },
+          h(SwitchField, {
             label: '读取本机 B 站登录凭证',
             note: '关掉 = 纯匿名，最高只到 480P；凭证内容不进面板，这里只存路径',
+            source: srcText('biliUseCredential'),
             on: form.biliUseCredential !== false,
             onChange: (v) => setKey('biliUseCredential', v),
           }),
-          h(Field, {
-            label: '凭证文件路径',
+          h(TextField, {
+            label: 'B站 凭证文件路径',
             note: '留空 = 按顺序自动查找（DSH_BILI_CREDENTIAL → %APPDATA%\\dsh-desktop\\harness\\bili-duty → $DSH_HOME / ~/.dsh）',
             placeholder: st.credential || '自动查找',
             value: form.biliCredentialPath,
             source: srcText('biliCredentialPath'),
             onChange: (v) => setKey('biliCredentialPath', v),
           }),
-          h('div', { 'data-vd-note': '' }, st.credential
+          h('div', { 'data-vd-hint': '' }, st.credential
             ? '找到的凭证文件：' + st.credential
             : '没找到凭证文件（此时自动退回匿名 480P）')),
 
-        h('div', { 'data-vd-sec': '' },
-          h('div', { 'data-vd-h': '' }, '通用后端（非 B站 站点）'),
-          h('div', { 'data-vd-row': '' },
-            h('div', { 'data-vd-grow': '' },
-              h('div', { 'data-vd-label': '' }, '后端顺序'),
-              h('div', { 'data-vd-note': '' }, 'lux 只补 yt-dlp 没有的国内站（快手、腾讯视频、好看视频…），站点接口一改就失效，所以默认让它兜底；抖音固定走浏览器通路，不会用 lux'),
-              h('div', { 'data-vd-src': '' }, srcText('genericBackend'))),
-            h('div', { style: { width: '52%', maxWidth: '520px' } },
-              h('select', {
-                'data-vd-input': '',
-                value: form.genericBackend || 'auto',
-                onChange: (e) => setKey('genericBackend', e.target.value),
-              }, BACKEND_OPTIONS.map(([v, label]) => h('option', { key: v, value: v }, label))))),
-          h('div', { 'data-vd-note': '' },
-            '现在实际顺序：' + ((st.genericOrder && st.genericOrder.length) ? st.genericOrder.join(' → ') : '—')
-            + '（只有「这个后端干不了」才会换下一个；要登录或被风控时直接报错，不换）')),
-
-        h('div', { 'data-vd-sec': '' },
-          h('div', { 'data-vd-h': '' }, '外部组件'),
-          h(Field, {
-            label: 'ffmpeg 路径',
-            note: '留空 = 自动探测；填错会退回自动探测，不会让下载直接失败',
-            placeholder: st.ffmpeg || '自动探测',
-            value: form.ffmpegPath,
-            source: srcText('ffmpegPath'),
-            onChange: (v) => setKey('ffmpegPath', v),
+        h(Section, { title: '后端与代理', sum: (form.genericBackend || 'auto') + ' · ' + ((st.genericOrder && st.genericOrder.length) ? st.genericOrder.join(' → ') : '—') },
+          h(SelectField, {
+            label: '非 B站 站点后端顺序',
+            note: 'lux 只补 yt-dlp 没有的国内站（快手、腾讯视频、好看视频…），站点接口一改就失效，所以默认让它兜底；抖音固定走浏览器通路',
+            source: srcText('genericBackend'),
+            value: form.genericBackend,
+            options: BACKEND_OPTIONS,
+            onChange: (v) => setKey('genericBackend', v),
           }),
-          h(Field, {
-            label: 'yt-dlp 路径',
-            note: '留空 = 自动探测；非 B站 站点（抖音、小红书、YouTube…）用它',
-            placeholder: st.ytdlp || '自动探测',
-            value: form.ytdlpPath,
-            source: srcText('ytdlpPath'),
-            onChange: (v) => setKey('ytdlpPath', v),
-          }),
-          h(Field, {
-            label: 'lux 路径',
-            note: '留空 = 自动探测（DSH_LUX_PATH → PATH → GOBIN → ~/go/bin）；只在 yt-dlp 干不了时被调用',
-            placeholder: st.lux || '自动探测',
-            value: form.luxPath,
-            source: srcText('luxPath'),
-            onChange: (v) => setKey('luxPath', v),
-          }),
-          h(Field, {
-            label: 'yt-dlp 代理',
-            note: '只作用于非 B站 站点（yt-dlp 与 lux 共用）；B站 与抖音强制直连。例：http://127.0.0.1:7890',
+          h('div', { 'data-vd-hint': '' },
+            '实际顺序：' + ((st.genericOrder && st.genericOrder.length) ? st.genericOrder.join(' → ') : '—')
+            + '；只有「这个后端干不了」才换下一个，要登录或被风控时直接报错'),
+          h(TextField, {
+            label: '代理',
+            note: '只作用于非 B站 站点（yt-dlp 与 lux 共用）；B站、快手、抖音强制直连。例：http://127.0.0.1:7890',
             placeholder: '留空 = 不用代理',
             value: form.ytdlpProxy,
             source: srcText('ytdlpProxy'),
             onChange: (v) => setKey('ytdlpProxy', v),
           })),
 
-        h('div', { 'data-vd-note': '' },
+        h(Section, { title: '外部组件路径', sum: [st.ffmpeg, st.ytdlp, st.lux].filter(Boolean).length + ' / 3 已找到' },
+          h(TextField, {
+            label: 'ffmpeg',
+            note: '留空 = 自动探测；填错会退回自动探测，不会让下载直接失败',
+            placeholder: st.ffmpeg || '自动探测',
+            value: form.ffmpegPath,
+            source: srcText('ffmpegPath'),
+            onChange: (v) => setKey('ffmpegPath', v),
+          }),
+          h(TextField, {
+            label: 'yt-dlp',
+            note: '留空 = 自动探测；非 B站 站点（抖音、小红书、YouTube…）用它',
+            placeholder: st.ytdlp || '自动探测',
+            value: form.ytdlpPath,
+            source: srcText('ytdlpPath'),
+            onChange: (v) => setKey('ytdlpPath', v),
+          }),
+          h(TextField, {
+            label: 'lux',
+            note: '留空 = 自动探测（DSH_LUX_PATH → PATH → GOBIN → ~/go/bin）；只在 yt-dlp 干不了时被调用',
+            placeholder: st.lux || '自动探测',
+            value: form.luxPath,
+            source: srcText('luxPath'),
+            onChange: (v) => setKey('luxPath', v),
+          })),
+
+        h('div', { 'data-vd-foot': '' },
           '优先级：单次工具调用传参 > 这一页 > 环境变量 > 内置默认。留空 = 没设（退回下一层），清空这一页不会让插件失效。'))
     }
 

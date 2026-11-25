@@ -71,7 +71,7 @@ export const Config = !z
       crawlPlatform: z
         .string()
         .default('kuaishou')
-        .description('关键词/作者批量爬取的默认平台：kuaishou（快手）/ bilibili（B站）')
+        .description('关键词/作者批量爬取的默认平台：kuaishou（快手）/ bilibili（B站）/ douyin（抖音）')
         .extra('volatile', true),
       defaultQuality: z
         .string()

@@ -16,12 +16,14 @@
  */
 
 import { createBilibiliAdapter } from './bilibili.js'
+import { createDouyinAdapter } from './douyin.js'
 import { createKuaishouAdapter } from './kuaishou.js'
 
 export function createPlatformRegistry({ resolveBilibili = null, downloadBilibili = null, ffmpeg = null, quality } = {}) {
   const list = [
     createKuaishouAdapter(),
     createBilibiliAdapter({ resolveBilibili, downloadBilibili, ffmpeg, quality }),
+    createDouyinAdapter(),
   ]
   const map = new Map(list.map((a) => [a.id, a]))
   return {
@@ -34,12 +36,13 @@ export function createPlatformRegistry({ resolveBilibili = null, downloadBilibil
 }
 
 /**
- * 从任意输入猜平台：主页链接、作品链接、裸 bvid 都试一遍。
- * 抖音通道还没实现，这里不返回 douyin，免得调用方以为能用。
+ * 从任意输入猜平台：主页链接、作品链接、裸 bvid / sec_uid 都试一遍。
  */
 export function detectCrawlPlatform(input) {
   const text = String(input || '').trim()
   if (/bilibili\.com|b23\.tv/i.test(text) || /^BV1[A-Za-z0-9]{9}$/i.test(text)) return 'bilibili'
   if (/kuaishou\.com|kwai\.com|chenzhongtech\.com/i.test(text)) return 'kuaishou'
+  if (/douyin\.com|iesdouyin\.com/i.test(text)) return 'douyin'
+  if (/^MS4wLjABAAAA[A-Za-z0-9_\-]+$/.test(text)) return 'douyin'
   return ''
 }

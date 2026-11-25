@@ -102,7 +102,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 找不到时不会静默失败：音视频分别落盘，返回值里 `muxed: false` 并给出合并命令；只有单条流的站点不需要 ffmpeg。
 
-## 批量爬取（快手 / B站）
+## 批量爬取（快手 / B站 / 抖音）
 
 两个入口，两种落点：
 
@@ -111,7 +111,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | 关键词 | `video_crawl { "keyword": "和田大枣", "limit": 50 }` | `<爬取根>\<平台>\<关键词>\` |
 | 作者主页 | `video_crawl { "creator": "https://space.bilibili.com/3494363638270349/video", "limit": 30 }` | `<爬取根>\<平台>\<作者名>\`（名字是链接里拿不到的就用 id） |
 
-`keyword` 与 `creator` 二选一；`platform` 不给时按链接/关键词自动判断（`bilibili.com`/`BV` 号 → bilibili，`kuaishou.com`/`kwai.com` → kuaishou）。抖音的批量通道还没实现，`detectCrawlPlatform` 故意不返回 douyin。
+`keyword` 与 `creator` 二选一；`platform` 不给时按链接自动判断（`bilibili.com`/`BV` 号 → bilibili，`kuaishou.com`/`kwai.com` → kuaishou，`douyin.com`/`MS4wLjABAAAA…` → douyin），都认不出来才落到设置页的默认平台。
 
 平台差异全部落在 `src/platforms/<平台>.js` 的适配器里（`searchKeyword` / `listCreator` / `download` / `supportsLikeFilter` / `maxConcurrency`），`crawl.js` 只负责调度、筛选、去重、并发、续传、计时——加新平台不用动调度层。
 
@@ -164,16 +164,33 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - 搜索结果的标题带 `<em class="keyword">…</em>` 高亮标签，落盘前会清掉；`duration` 是 `mm:ss` / `hh:mm:ss` 文本，转成毫秒。
 - 下载复用插件已有的 B站单链下载（DASH 选流 + ffmpeg 合并），所以 B站批量**需要 ffmpeg**。
 
+### 抖音
+
+**不移植 a_bogus**：抖音网页接口的 `a_bogus` / `msToken` 随版本变，硬算出来的签名活不了几天。所以这条通道起一个**有头 Edge + 持久 profile**，打开 `https://www.douyin.com/jingxuan` 后在**页面内** `fetch` 官方接口，让抖音自己的运行时把易变安全字段补上——我们只负责参数与解码。
+
+| 入口 | 接口 | 分页 |
+| --- | --- | --- |
+| 关键词 | `/aweme/v1/web/general/search/stream/` | `offset` 递增，`has_more` 判停 |
+| 作者主页 | `/aweme/v1/web/aweme/post/` | `max_cursor`，`has_more` 判停 |
+
+- 搜索返回是 **HTTP chunked 帧**（`<hex 长度>\r\n<json>`，以 `0` 块结束），必须按**字节**切——用字符串下标会在中文上错位（踩过一次，表现为「解出 0 帧」）。
+- 参数里除关键词与游标外还要四个浏览器派生字段（`browser_version` / `engine_version` / `cpu_core_num` / `device_memory`）以及 `screen_width|height`（优先取 cookie `dy_swidth` / `dy_sheight`）。
+- **必须登录**：未登录直接回 `status_code: 2483 请先登录`。首次跑会自动打开浏览器请你扫码，`needHuman` 带提示与截图，确认后任务自动继续（最多等 3 分钟）；登录态存在 `<DSH_HOME>\video-downloader\douyin\profile`，后续复用。
+- 错误分流：`8` / `2483` 或文案含「未登录」→ `need_login`；文案或 `search_nil_info` 含 `verify` / `captcha` / `risk` → `captcha`（暂停等人工）；`2154` / `10000` → `rate_limited`；其余非 0 码 → `blocked`。
+- 下载：`video.play_addr.url_list` 是 CDN 直链，走内置 `downloadDirect`（不转码、不合并），首个候选失败自动换 `backupUrl`。
+- 图集作品（只有 `images`、没有 `video`）不下载，记 `noSource`。
+
 ### 各平台对照
 
-| | 快手 | B站 |
-| --- | --- | --- |
-| 搜索通道 | 有头 Edge + 页面内现签名 | 纯 HTTP + wbi 签名 |
-| 登录 | 必须（首次扫码，持久 profile） | 不需要 |
-| 作者主页 | `/rest/v/profile/feed` | `/x/space/wbi/arc/search` |
-| 点赞筛选 | 有效 | 仅关键词入口有效 |
-| 下载 | 单文件 mp4 直链（HLS 才借 ffmpeg） | DASH 分离，需 ffmpeg |
-| 并发上限 | 6 | 2 |
+| | 快手 | B站 | 抖音 |
+| --- | --- | --- | --- |
+| 搜索通道 | 有头 Edge + 页面内现签名 | 纯 HTTP + wbi 签名 | 有头 Edge + 页面内 fetch（自己不打签名） |
+| 登录 | 必须（首次扫码，持久 profile） | 不需要 | 必须（首次扫码，持久 profile） |
+| 关键词分页 | `pcursor` | 页码 `page` | `offset` |
+| 作者主页 | `/rest/v/profile/feed` | `/x/space/wbi/arc/search` | `/aweme/v1/web/aweme/post/` |
+| 点赞筛选 | 有效 | 仅关键词入口有效 | 两个入口都有效 |
+| 下载 | 单文件 mp4 直链（HLS 才借 ffmpeg） | DASH 分离，需 ffmpeg | CDN 直链，不需 ffmpeg |
+| 并发上限 | 6 | 2 | 3 |
 
 
 ## 抖音通路
@@ -204,7 +221,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 **设置 → 左侧栏「视频下载」**（与「刷B站」同级的那一页）。改完点保存即生效，不用重启；留空 = 没设（退回下一层），所以清空设置页不会让插件失效。
 
-页面顶部是只读状态：B站 是否读到登录凭证、ffmpeg / yt-dlp / lux 是否就绪、当前实际落盘目录、找到的凭证文件路径。
+页面顶部是一条吸顶状态带：ffmpeg / yt-dlp / lux 是否就绪、B站 登录态、还有几项改动没保存，右侧是「保存 / 重新读取」。下面按用途分成可折叠的分区（下载落点与清晰度、批量爬取、账号、后端与代理、外部组件路径），**分区标题右侧直接显示这一项现在其实是什么**——默认状态下一屏就能看完所有当前生效值，想改再展开。
 
 | 设置项 | 默认 | 说明 |
 | --- | --- | --- |
@@ -237,6 +254,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - **其他站点**：交给通用后端——yt-dlp 优先、lux 兜底，覆盖两者支持的站点（小红书、YouTube、Vimeo、快手、腾讯视频、好看视频等）。lux 的增量价值就是那几个 yt-dlp 没有的国内站；两边都有时仍由 yt-dlp 出手（适配与维护更好）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
 - **快手（关键词爬取）**：按关键词批量抓，落 `<根>\快手\<关键词>\`。走本地浏览器拿签名 + 网页搜索接口翻页 + CDN 直链下载，不需要 yt-dlp / lux；只有极少数只给 HLS 播放列表的作品才借 ffmpeg 合并。首次要扫码登录一次，cookie 由持久 profile 维持；直播、私密作品、需要付费的内容不处理。遇到验证码会被拦下等你人工处理，不会硬闯。
 - **B站（关键词 + 作者主页爬取）**：纯 HTTP + wbi 签名，不需要浏览器、不需要登录。关键词落 `<根>\B站\<关键词>\`，作者主页落 `<根>\B站\<作者名>\`；下载复用单链通路的 DASH 选流 + ffmpeg 合并。作者主页接口不返回点赞，该入口自动忽略「最低点赞」条件。风控（`-352`）按频率触发，冷却几分钟后 `video_crawl_resume` 续跑。
+- **抖音（关键词 + 作者主页爬取）**：走有头浏览器的页面内 fetch，不自己算 `a_bogus`，因此**需要登录**（首次扫码，之后复用持久 profile）。关键词落 `<根>\抖音\<关键词>\`，作者主页落 `<根>\抖音\<作者名>\`；视频是 CDN 直链，不需要 ffmpeg。图集作品跳过。
 - **不做**：DRM 内容、付费墙绕过。
 
 ## 安装
@@ -278,7 +296,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（抖音故意不认）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞），以及八个工具的注册与错误分支。当前 49 个用例。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（快手/B站/抖音）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞）、抖音 chunked 帧解码与错误分流、抖音行映射（缺字段保持 undefined）、抖音文件名与游标抽取，以及八个工具的注册与错误分支。当前 54 个用例。
 
 ## 许可证
 
