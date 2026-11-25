@@ -63,33 +63,43 @@ export function kuaishouVerdict(result, errorMsg) {
   return { kind: 'failed', message: msg || `未知返回码 ${n}` }
 }
 
+/** 播放列表地址（`.m3u8` 或带 hls 标记的）——这类地址直接落盘会得到一段文本，得走 ffmpeg 合并。 */
+export function kuaishouIsHlsUrl(url) {
+  return /\.m3u8(\?|#|$)/i.test(String(url || '')) || /[/_-]hls[/_-]/i.test(String(url || ''))
+}
+
 /**
  * 从一个 feed 里挑出可下载的直链。manifest 里可能有多个 adaptationSet
  * （不同清晰度/编码），这里挑体积最大的一条；返回 null 表示没有直链。
+ *
+ * 单文件 mp4 优先：HLS 播放列表还要再合并一道，能省就省；
+ * 只有当所有变体都是 HLS 时才返回 HLS（`hls: true`），让下载层去做合并。
  */
 export function kuaishouPickSource(photo) {
   const manifest = photo?.manifest
   if (!manifest || typeof manifest !== 'object') return null
   const sets = Array.isArray(manifest.adaptationSet) ? manifest.adaptationSet : []
-  let best = null
+  const candidates = []
   for (const set of sets) {
     const reps = Array.isArray(set?.representation) ? set.representation : []
     for (const rep of reps) {
       const url = typeof rep?.url === 'string' ? rep.url : ''
       if (!url.startsWith('http')) continue
-      const size = Number(rep.size) || 0
-      const candidate = {
+      candidates.push({
         url,
         backupUrl: Array.isArray(rep.backupUrl) ? rep.backupUrl.filter((u) => typeof u === 'string' && u.startsWith('http')) : [],
-        size,
+        size: Number(rep.size) || 0,
         width: Number(rep.width) || 0,
         height: Number(rep.height) || 0,
         codecs: typeof rep.codecs === 'string' ? rep.codecs : '',
-      }
-      if (!best || candidate.size > best.size) best = candidate
+        hls: kuaishouIsHlsUrl(url),
+      })
     }
   }
-  return best
+  if (!candidates.length) return null
+  const direct = candidates.filter((c) => !c.hls)
+  const pool = direct.length ? direct : candidates
+  return pool.reduce((a, b) => (b.size > a.size ? b : a))
 }
 
 /** 把搜索响应里的 feeds 归一化成爬取任务要的行。纯函数。 */

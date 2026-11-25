@@ -12,7 +12,11 @@
  *   - 已在索引里且文件还在盘的条目跳过（可重复跑，增量）。
  */
 
-import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync, closeSync, createWriteStream, existsSync, mkdirSync, openSync,
+  readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+} from 'node:fs'
+import { execFile } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { randomBytes } from 'node:crypto'
@@ -147,8 +151,90 @@ export function summarizeTimings(timings = {}) {
   }
 }
 
-/** 下载一条直链到文件，失败时按 backupUrl 逐个重试。 */
-async function downloadDirect(url, file, { signal, backupUrls = [] } = {}) {
+/** 快手有时候只给 HLS 播放列表，直接存下来是一段文本而不是视频。 */
+const HLS_MAGIC = '#EXTM3U'
+
+/** 读文件头几个字节（用来判断落盘的到底是视频还是播放列表）。 */
+function readHead(file, bytes = 256) {
+  let fd = -1
+  try {
+    fd = openSync(file, 'r')
+    const buf = Buffer.alloc(bytes)
+    const len = readSync(fd, buf, 0, bytes, 0)
+    return buf.subarray(0, len).toString('utf8')
+  } catch {
+    return ''
+  } finally {
+    if (fd >= 0) try { closeSync(fd) } catch {}
+  }
+}
+
+/**
+ * 把播放列表里的相对分片地址补成绝对地址。纯函数。
+ * ffmpeg 吃本地 m3u8 时会把相对路径按 `file://` 解析，所以必须先补全。
+ */
+export function absolutizePlaylist(text, sourceUrl) {
+  const href = String(sourceUrl || '')
+  const cut = href.lastIndexOf('/')
+  if (cut < 0) return String(text || '')
+  const dir = href.slice(0, cut + 1)
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => {
+      const t = line.trim()
+      if (!t || t.startsWith('#')) return line
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return line
+      return dir + t
+    })
+    .join('\n')
+}
+
+/** 跑一次 ffmpeg，把 stderr 尾巴带进错误信息（缺参数时看这个）。 */
+function runFfmpeg(bin, args, { signal, timeoutMs = 600000 } = {}) {
+  return new Promise((res, rej) => {
+    execFile(bin, args, { signal, timeout: timeoutMs, windowsHide: true, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+      if (err) {
+        const tail = String(stderr || '').trim().split(/\r?\n/).slice(-3).join(' | ')
+        err.message = `${err.message}${tail ? `：${tail}` : ''}`
+        rej(err)
+        return
+      }
+      res(String(stdout || ''))
+    })
+  })
+}
+
+/**
+ * 把已落盘的播放列表合并成 mp4：重写成分片绝对地址的临时 m3u8 → ffmpeg 直拷。
+ * 成功返回最终 mp4 的字节数；失败抛错（调用方负责清理）。
+ */
+async function mergeHlsToMp4(playlistFile, mp4File, sourceUrl, { signal, ffmpeg } = {}) {
+  const bin = typeof ffmpeg === 'function' ? ffmpeg() : ffmpeg
+  if (!bin) throw new Error('这条是 HLS 播放列表，需要 ffmpeg 合并，但没找到可用的 ffmpeg')
+  const list = `${mp4File}.hls.m3u8`
+  const tmpOut = `${mp4File}.tmp.mp4`
+  try {
+    writeFileSync(list, absolutizePlaylist(readFileSync(playlistFile, 'utf8'), sourceUrl), 'utf8')
+    // 本地 m3u8 里的分片是 http(s) 绝对地址，必须放开协议白名单，否则 hls demuxer 只认 file/crypto/data。
+    // 注意别再传 -user_agent / -headers：这版 ffmpeg 的 CLI 不把 http 协议私有选项当 input option 解析，
+    // 会直接报 "Option not found" 而整体失败（实测）。
+    await runFfmpeg(bin, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+      '-f', 'hls', '-i', list,
+      '-c', 'copy', tmpOut,
+    ], { signal })
+    rmSync(mp4File, { force: true })
+    renameSync(tmpOut, mp4File)
+    return statSync(mp4File).size
+  } finally {
+    rmSync(list, { force: true })
+    rmSync(tmpOut, { force: true })
+  }
+}
+
+/** 下载一条直链到文件，失败时按 backupUrl 逐个重试；落盘是播放列表就合并成 mp4。 */
+async function downloadDirect(url, file, { signal, backupUrls = [], ffmpeg } = {}) {
   const headers = { 'user-agent': UA, referer: 'https://www.kuaishou.com/', accept: '*/*' }
   const once = async (target) => {
     const res = await fetch(target, { headers, signal, redirect: 'follow' })
@@ -169,9 +255,15 @@ async function downloadDirect(url, file, { signal, backupUrls = [] } = {}) {
   let lastErr = null
   for (const target of candidates) {
     try {
-      return await once(target)
+      const bytes = await once(target)
+      if (readHead(file, 16).startsWith(HLS_MAGIC)) {
+        const merged = await mergeHlsToMp4(file, file, target, { signal, ffmpeg })
+        return merged
+      }
+      return bytes
     } catch (err) {
       lastErr = err
+      try { rmSync(file, { force: true }) } catch {}
       if (signal?.aborted) break
     }
   }
@@ -190,7 +282,7 @@ class PauseSignal extends Error {
 /**
  * 爬取任务管理器。一个实例管若干 job；job 是异步跑的，start 立刻返回。
  */
-export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', defaultFilters = {}, log = () => {} }) {
+export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', defaultFilters = {}, log = () => {}, ffmpeg = null }) {
   const indexFile = crawlIndexPath(stateDir)
   const jobsDir = crawlDirName(stateDir)
   const profileDir = join(stateDir, 'kuaishou', 'profile')
@@ -357,7 +449,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         const itemStartedAt = Date.now()
         try {
           mkdirSync(job.dir, { recursive: true })
-          const bytes = await downloadDirect(row.source.url, file, { signal, backupUrls: row.source.backupUrl })
+          const bytes = await downloadDirect(row.source.url, file, { signal, backupUrls: row.source.backupUrl, ffmpeg })
           row.status = 'done'
           row.file = file
           row.bytes = bytes

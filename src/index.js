@@ -2563,6 +2563,8 @@ function crawlerOf() {
       stateDir: stateDirOf(),
       defaultRoot: defaultCrawlRoot(),
       platform: 'kuaishou',
+      // 快手偶尔只给 HLS 播放列表，落盘后要用 ffmpeg 合并；惰性求值，缺 ffmpeg 时那条记失败而不是整任务崩
+      ffmpeg: () => findFfmpeg(),
     })
   }
   return crawlerInstance

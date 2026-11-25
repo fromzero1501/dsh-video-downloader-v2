@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链接就能下载，不需要先拿到直链。
 
-面向 **DSH 0.2.1-rc.2** 重写，四条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底），快手另有关键词批量爬取（本地浏览器拿签名 → 搜索接口翻页 → CDN 直链下载，不需要 yt-dlp / lux / ffmpeg）。
+面向 **DSH 0.2.1-rc.2** 重写，四条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底），快手另有关键词批量爬取（本地浏览器拿签名 → 搜索接口翻页 → CDN 直链下载，不需要 yt-dlp / lux）。
 
 ## 功能
 
@@ -107,7 +107,9 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 **怎么拿数据**：快手网页端的搜索接口要一个叫 `__NS_hxfalcon` 的签名，签名必须由页面自己的 JS 现算（绑定请求体 + 时间窗口），所以插件起一个**有头 Edge + 持久 profile**，用 `Page.addScriptToEvaluateOnNewDocument` 在页面脚本之前劫持 `Object.prototype.caver` 的 setter，抓住同时带 `$encode` 与 `$getCatVersion` 的那个对象，再在页面里 `call('$encode', ...)` 生成签名，然后**在页面内** `fetch('/rest/v/search/feed?__NS_hxfalcon=<sign>&caver=2')`。每页 20 条，`pcursor` 递增翻页。
 
-**为什么不用 yt-dlp / lux**：两者都只能吃单链接，不认关键词；而且快手的 `photo.manifest.adaptationSet[].representation[].url` 是现成的单文件 mp4 直链（免 Cookie 免签名，Node 侧 Range 请求实测 206），所以下载这条链路不依赖 ffmpeg、也不需要合并分片。
+**为什么不用 yt-dlp / lux**：两者都只能吃单链接，不认关键词；而且快手的 `photo.manifest.adaptationSet[].representation[].url` 多数是现成的单文件 mp4 直链（免 Cookie 免签名，Node 侧 Range 请求实测 206），下载这条链路不需要合并分片。
+
+**HLS 回落**：少数作品的所有变体都只给 `.m3u8` 播放列表，直接按 URL 落盘会存下一段 `#EXTM3U` 文本。所以挑流时**优先非 HLS 变体**；只剩 HLS 时才下载播放列表、把里面的相对分片地址补成绝对地址、交给 ffmpeg `-c copy` 合并成 mp4（不转码）。没装 ffmpeg 时该条记 `failed` 并在 `error` 里说明，不影响同批其他条。
 
 **登录态**：首次跑会自动打开浏览器，`needHuman.qrPath` 给出二维码截图路径，你在手机上扫码确认后任务自动继续（最多等 3 分钟）。cookie 存在 `<DSH_HOME>\video-downloader\kuaishou\profile\`（Edge 的持久 profile），后续任务直接复用，不用重复扫码。
 
@@ -181,7 +183,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - **抖音**：`/video/<id>`、个人页 `?modal_id=<id>`、`v.douyin.com/<码>` 短链、整段分享文本（含短链）、裸的 19 位 id 都认；走本地浏览器通路，默认不需要 Cookie、不需要登录，公开作品即可下。直播、会员、私密作品不处理。
 - **直链媒体**：mp4 / m4s / webm / mkv / flv / ts 按扩展名与 Content-Type 判定，原生下载；m3u8 / mpd 是播放列表不是媒体本身，交给 yt-dlp 拉流合并，不再当成视频文件直接存盘。
 - **其他站点**：交给通用后端——yt-dlp 优先、lux 兜底，覆盖两者支持的站点（小红书、YouTube、Vimeo、快手、腾讯视频、好看视频等）。lux 的增量价值就是那几个 yt-dlp 没有的国内站；两边都有时仍由 yt-dlp 出手（适配与维护更好）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
-- **快手（关键词爬取）**：按关键词批量抓，落 `<根>\快手\<关键词>\`。走本地浏览器拿签名 + 网页搜索接口翻页 + CDN 直链下载，不需要 yt-dlp / lux / ffmpeg。首次要扫码登录一次，cookie 由持久 profile 维持；直播、私密作品、需要付费的内容不处理。遇到验证码会被拦下等你人工处理，不会硬闯。
+- **快手（关键词爬取）**：按关键词批量抓，落 `<根>\快手\<关键词>\`。走本地浏览器拿签名 + 网页搜索接口翻页 + CDN 直链下载，不需要 yt-dlp / lux；只有极少数只给 HLS 播放列表的作品才借 ffmpeg 合并。首次要扫码登录一次，cookie 由持久 profile 维持；直播、私密作品、需要付费的内容不处理。遇到验证码会被拦下等你人工处理，不会硬闯。
 - **不做**：DRM 内容、付费墙绕过。
 
 ## 安装

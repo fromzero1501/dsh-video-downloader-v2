@@ -36,6 +36,7 @@ import {
 } from '../src/index.js'
 import {
   indexHit,
+  absolutizePlaylist,
   loadCrawlIndex,
   normalizeCrawlFilters,
   passesCrawlFilter,
@@ -46,6 +47,7 @@ import {
 import {
   kuaishouFeeds,
   kuaishouFileName,
+  kuaishouIsHlsUrl,
   kuaishouPickSource,
   kuaishouVerdict,
 } from '../src/kuaishou.js'
@@ -479,6 +481,55 @@ test('kuaishouPickSource takes the largest representation and keeps backups', ()
   assert.deepEqual(src.backupUrl, [])
   assert.equal(kuaishouPickSource({}), null)
   assert.equal(kuaishouPickSource({ manifest: { adaptationSet: [] } }), null)
+})
+
+test('kuaishouPickSource prefers a direct mp4 over a bigger HLS variant', () => {
+  // 快手有时只给 m3u8：能拿 mp4 就拿 mp4，拿不到才回落到 HLS 并打上标记
+  const mixed = {
+    manifest: {
+      adaptationSet: [
+        { representation: [
+          { url: 'https://cdn/v.m3u8?pkey=AA', size: 0 },
+          { url: 'https://cdn/v.mp4', size: 1200 },
+        ] },
+        { representation: [{ url: 'https://cdn/v-hd.m3u8', size: 9999 }] },
+      ],
+    },
+  }
+  const picked = kuaishouPickSource(mixed)
+  assert.equal(picked.url, 'https://cdn/v.mp4')
+  assert.equal(picked.hls, false)
+
+  const hlsOnly = {
+    manifest: { adaptationSet: [{ representation: [{ url: 'https://cdn/only.m3u8?ftt=R', size: 7 }] }] },
+  }
+  const fallback = kuaishouPickSource(hlsOnly)
+  assert.equal(fallback.url, 'https://cdn/only.m3u8?ftt=R')
+  assert.equal(fallback.hls, true)
+
+  assert.equal(kuaishouIsHlsUrl('https://cdn/a.m3u8?x=1'), true)
+  assert.equal(kuaishouIsHlsUrl('https://cdn/hls/seg.ts'), true)
+  assert.equal(kuaishouIsHlsUrl('https://cdn/a.mp4'), false)
+})
+
+test('absolutizePlaylist rewrites segments and leaves tags and absolute urls alone', () => {
+  const text = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXTINF:8.333333,',
+    '5194339438801540507_5d33ae2c_5687_hlsob.00000.ts?ftt=R&x-ks-pt',
+    'https://other.cdn/abs.ts',
+    '',
+  ].join('\n')
+  const out = absolutizePlaylist(text, 'https://v.cdn/ks/path/list.m3u8?pkey=AA')
+  const lines = out.split('\n')
+  assert.equal(lines[0], '#EXTM3U')
+  assert.equal(lines[1], '#EXT-X-VERSION:3')
+  assert.equal(
+    lines[3],
+    'https://v.cdn/ks/path/5194339438801540507_5d33ae2c_5687_hlsob.00000.ts?ftt=R&x-ks-pt',
+  )
+  assert.equal(lines[4], 'https://other.cdn/abs.ts')
 })
 
 test('kuaishouFeeds normalises like/view/timestamp and falls back to realLikeCount', () => {
