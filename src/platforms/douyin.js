@@ -410,6 +410,17 @@ export async function openDouyinSession({ profileDir, log = () => {}, signal, po
       hasLogin,
       screenshot,
       fetchInPage,
+      /** 页面内执行一段 JS（取 DOM 文本用），失败返回 undefined。 */
+      evaluate: evalP,
+      /**
+       * 换到另一个抖音页面再操作。实测 `/aweme/v1/web/user/profile/self/` 只在
+       * `https://www.douyin.com/user/self` 这一页能认登录态（在 jingxuan 下返回
+       * status_code 8「用户未登录」），所以取昵称前要先导航过去。
+       */
+      goto: async (url, waitMs = 2500) => {
+        await send('Page.navigate', { url }, sessionId)
+        await sleep(waitMs)
+      },
       close,
     }
   } catch (e) {
@@ -471,6 +482,54 @@ export function createDouyinAdapter() {
         cursor: r.cursor,
         hasMore: r.hasMore,
         authorName: r.rows[0]?.author || '',
+      }
+    },
+
+    /**
+     * 登录态下取自己的昵称，供设置页「账号」栏显示。
+     * 实测 `/aweme/v1/web/user/profile/self/` 即使带着有效 sessionid 也回
+     * status_code 8「用户未登录」（该接口要页面签名），所以走 `/user/self` 页面的 DOM，
+     * `h1` 就是昵称。抖音号（`[data-e2e="user-info"]`）在 textContent 里与「N岁/关注/粉丝」
+     * 拼在一起、位数不固定，取出来会多一两位，所以 id 改用 cookie 里的 uid_tt。
+     */
+    async account(session) {
+      try {
+        if (session?.goto) await session.goto('https://www.douyin.com/user/self', 2500)
+        const probe = `(() => {
+          const name = (document.querySelector('h1')?.textContent || '').trim()
+            || String(document.title || '').replace(/的抖音.*$/, '');
+          return JSON.stringify({ name });
+        })()`
+        // 页面渲染快慢不定，轮询到昵称出来为止（最多约 15 秒）
+        let name = ''
+        for (let i = 0; i < 10; i++) {
+          const raw = await session?.evaluate?.(probe)
+          if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+            try {
+              const parsed = JSON.parse(raw)
+              const got = String(parsed?.name || '').trim()
+              if (got) {
+                name = got
+                break
+              }
+            } catch {
+              /* 还没渲染好，继续等 */
+            }
+          }
+          await new Promise((r) => setTimeout(r, 1500))
+        }
+        if (!name) return null
+        let id = ''
+        try {
+          const jar = await session?.readCookies?.()
+          const find = (k) => ((Array.isArray(jar) ? jar : []).find((c) => c?.name === k)?.value || '')
+          id = find('uid_tt') || find('uid_tt_ss') || ''
+        } catch {
+          /* 拿不到 uid 就只显示昵称 */
+        }
+        return { name, id }
+      } catch {
+        return null
       }
     },
 

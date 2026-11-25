@@ -402,6 +402,7 @@ export function createCrawler({
   ffmpeg = null,
   adapters = null,
   tuning = {},
+  sessionProvider = null,
 }) {
   const defaultPlatform = String(platform || 'kuaishou').toLowerCase()
   // 采集节奏：设置页能改的所有旋钮都收在这里，job 级传参会覆盖它。
@@ -725,11 +726,17 @@ export function createCrawler({
     aborts.set(job.id, controller)
     const { signal } = controller
     let session = null
+    let ownsSession = false
     try {
       job.startedAt = new Date().toISOString()
       setStatus(job, 'searching')
       const adapter = adapterOf(job.platform)
-      session = await adapter.openSession({ stateDir, log, signal, blockMedia: T.blockMedia })
+      // 会话优先复用调用方给的长连接（设置页常驻的浏览器），避免一个进程里反复开关同一份 profile。
+      if (sessionProvider) session = await sessionProvider(job.platform, adapter, { stateDir, log, signal, blockMedia: T.blockMedia })
+      else {
+        session = await adapter.openSession({ stateDir, log, signal, blockMedia: T.blockMedia })
+        ownsSession = true
+      }
 
       // 登录保障交给平台自己：快手要扫码，B站匿名也能搜。需要人工时由 onNeedHuman 落 waiting_login。
       const login = await adapter.ensureLogin(session, {
@@ -807,7 +814,8 @@ export function createCrawler({
         setStatus(job, 'failed', { error: String(err?.message || err), finishedAt: new Date().toISOString() })
       }
     } finally {
-      try { if (session) session.close() } catch {}
+      // 自己开的浏览器自己收；借来的常驻会话不动（设置页还在用）。
+      if (ownsSession) try { if (session) session.close() } catch {}
       aborts.delete(job.id)
     }
   }

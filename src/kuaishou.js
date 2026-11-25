@@ -327,6 +327,19 @@ export async function openKuaishouSession({ profileDir, log = () => {}, signal, 
       hasRealm: realm,
       searchOnce,
       profileFeedOnce,
+      /**
+       * 当前登录账号自己的资料。实测 `/rest/v/profile/get` body 传 {} 就返回本人：
+       * `{result:1, userName:"野怪", userId:2245497310, userHead:"..."}`。
+       */
+      accountOnce: async () => {
+        const payload = await restOnce({ path: '/rest/v/profile/get', body: {} })
+        if (!payload || typeof payload !== 'object' || payload.result !== 1) return null
+        return {
+          name: String(payload.userName || '').trim(),
+          id: String(payload.userId || '').trim(),
+          avatar: String(payload.userHead || '').trim(),
+        }
+      },
       restOnce,
       readCookies,
       hasLogin: async () => {

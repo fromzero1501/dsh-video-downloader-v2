@@ -106,6 +106,16 @@ export function createKuaishouAdapter() {
       }
     },
 
+    /** 登录态下取自己的昵称，供设置页「账号」栏显示。拿不到返回 null。 */
+    async account(session) {
+      try {
+        const a = await session?.accountOnce?.()
+        return a && a.name ? a : null
+      } catch {
+        return null
+      }
+    },
+
     canDownload(row) {
       return Boolean(row?.source?.url)
     },

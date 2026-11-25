@@ -90,6 +90,12 @@ window.__ModuleLoader__.load({
 [data-vd-label]{font-weight:500}
 [data-vd-note]{font-size:12px;opacity:.58;margin-top:2px}
 [data-vd-src]{font-size:11px;opacity:.42;margin-top:2px}
+[data-vd-acct]{display:flex;flex-direction:column;gap:8px;margin:2px 0 10px}
+[data-vd-acct-row]{display:flex;align-items:center;gap:10px;padding:8px 11px;border:1px solid rgba(127,127,127,.22);border-radius:10px}
+[data-vd-acct-row] b{font-weight:600;min-width:44px}
+[data-vd-acct-row] [data-vd-badge]{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;opacity:.7}
+[data-vd-acct-row] [data-vd-badge][data-ok],[data-vd-acct-row] [data-vd-badge][data-done],[data-vd-acct-row] [data-vd-badge][data-on]{opacity:1}
+[data-vd-acct-row] [data-vd-btn]{padding:4px 12px;font-size:12.5px}
 [data-vd-input]{box-sizing:border-box;width:100%;padding:7px 10px;border:1px solid rgba(127,127,127,.32);border-radius:9px;background:transparent;color:inherit;font-family:inherit;font-size:13px;transition:border-color .12s ease}
 [data-vd-input]:hover{border-color:rgba(127,127,127,.5)}
 [data-vd-input]:focus{outline:2px solid rgba(80,140,255,.4);outline-offset:0;border-color:rgba(80,140,255,.55)}
@@ -181,6 +187,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [msg, setMsg] = React.useState(null)
       const [fails, setFails] = React.useState(0)
+      const [loginBusy, setLoginBusy] = React.useState('')
 
       const adopt = (j) => {
         setState(j)
@@ -218,6 +225,55 @@ window.__ModuleLoader__.load({
         } finally { setBusy(false) }
       }
 
+      // ---- 扫码登录：起来后每 3 秒读一次 state，直到 status.login 不再是 running
+      const loginTried = React.useRef(false)
+      const doLogin = async (platform) => {
+        setLoginBusy(platform)
+        setMsg({ tone: 'warn', t: '已打开浏览器窗口，请扫码登录…' })
+        try {
+          await jpost('/login', { platform })
+        } catch (e) {
+          setLoginBusy('')
+          setMsg({ tone: 'warn', t: '拉起登录失败：' + String(e?.message ?? e) })
+          return
+        }
+        const started = Date.now()
+        const timer = setInterval(async () => {
+          try {
+            const j = await jget('/state?probe=1')
+            setState(j)
+            setFails(0)
+            const lg = (j.status || {}).login
+            if (lg && lg.state && lg.state !== 'running') {
+              clearInterval(timer)
+              setLoginBusy('')
+              setMsg(lg.state === 'ok'
+                ? { tone: 'good', t: '登录成功' + (lg.account?.name ? '：' + lg.account.name : '') }
+                : { tone: 'warn', t: '登录未完成：' + (lg.message || '超时') })
+              load(true)
+            }
+          } catch {
+            /* 网络抖动，继续等 */
+          }
+          if (Date.now() - started > 200000) {
+            clearInterval(timer)
+            setLoginBusy('')
+          }
+        }, 3000)
+      }
+
+      // 进设置页发现当前平台没登录（或还没取到账号名）→ 直接拉起扫码/读取登录态
+      React.useEffect(() => {
+        if (!state || loginTried.current) return
+        if (loginBusy || st.login?.state === 'running') return
+        const cur = (state.values || {}).crawlPlatform || 'kuaishou'
+        const p = (state.status?.profiles || {})[cur]
+        if (!p) return
+        if (p.exists && p.account?.name) return
+        loginTried.current = true
+        doLogin(cur)
+      }, [state])
+
       if (!state) {
         return h('div', { 'data-vd-page': '' },
           msg ? h('div', { 'data-vd-msg': '', 'data-warn': '' }, msg.t) : null,
@@ -247,6 +303,14 @@ window.__ModuleLoader__.load({
         form.crawlBlockMedia ? '屏蔽媒体' : '不屏蔽媒体',
       ].join(' · ')
 
+      // 账号栏：优先显示登录后拿到的昵称，其次显示「已登录/未登录」
+      const profiles = st.profiles || {}
+      const acctOf = (id) => {
+        const p = profiles[id] || {}
+        return p.account?.name || (p.exists ? '已登录' : '未登录')
+      }
+      const acctSum = '快手 ' + acctOf('kuaishou') + ' · 抖音 ' + acctOf('douyin')
+
       return h('div', { 'data-vd-page': '' },
 
         h('div', { 'data-vd-top': '' },
@@ -272,7 +336,7 @@ window.__ModuleLoader__.load({
         h(Section, { title: '下载落点与清晰度', open: true, sum: (st.downloadDir || '—') + ' · ' + (form.defaultQuality || 'best') },
           h(TextField, {
             label: '默认下载目录',
-            note: '留空 = 系统 Downloads\\dsh-video-downloader；目录不存在会自动创建',
+            note: '留空 = 系统下载目录',
             placeholder: st.downloadDir || '',
             value: form.downloadDir,
             source: srcText('downloadDir'),
@@ -280,7 +344,7 @@ window.__ModuleLoader__.load({
           }),
           h(SelectField, {
             label: '默认清晰度',
-            note: '没有权限的档位会自动降到账号可达的最高档，回报的是实际档位',
+            note: '达不到就自动降档，回报实际档位',
             source: srcText('defaultQuality'),
             value: form.defaultQuality,
             options: QUALITY_OPTIONS,
@@ -290,7 +354,7 @@ window.__ModuleLoader__.load({
         h(Section, { title: '批量爬取', open: true, sum: platformLabel(form.crawlPlatform || 'kuaishou') + ' · ' + filterText },
           h(SelectField, {
             label: '平台',
-            note: '关键词批量与作者主页批量都按这里的平台走；单次任务也可以用 video_crawl 的 platform 参数指定',
+            note: '关键词/作者主页批量都按它走',
             source: srcText('crawlPlatform'),
             value: form.crawlPlatform,
             options: PLATFORM_OPTIONS,
@@ -298,7 +362,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: '爬取根目录',
-            note: '落盘口径：<根>\\<平台>\\<关键词或作者名>\\<文件名>',
+            note: '落盘：<根>\\<平台>\\<关键词或作者名>',
             placeholder: crawlRoot,
             value: form.crawlRoot,
             source: srcText('crawlRoot'),
@@ -320,7 +384,7 @@ window.__ModuleLoader__.load({
           h('div', { 'data-vd-hint': '' }, '留空 = 用内置默认值（括号里那个）。这些值决定「会不会被风控」和「一条卡住要等多久」，改之前先看右边说明。'),
           h(TextField, {
             label: '下载并发',
-            note: '留空 = 6（实测 6 最快：6→36.7MB/s，8 反而掉到 30.7）；B站 自己会夹到 2',
+            note: '留空 = 6（B站 会夹到 2）',
             placeholder: String(tuning.concurrency || 6),
             value: form.crawlConcurrency,
             source: srcText('crawlConcurrency'),
@@ -328,7 +392,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: '翻页间隔（毫秒）',
-            note: '留空 = 1500，实际再加 0–1000ms 随机抖动。低于 300 会被风控',
+            note: '留空 = 1500；低于 300 会被风控',
             placeholder: String(tuning.pageDelayMs || 1500),
             value: form.crawlPageDelayMs,
             source: srcText('crawlPageDelayMs'),
@@ -336,7 +400,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: '换关键词停顿（毫秒）',
-            note: '留空 = 800（抖动 ±35%）。同一个词翻到底再换词前停一下，等于 0 会累计风控',
+            note: '留空 = 800，换词前停顿',
             placeholder: String(tuning.keywordGapMs || 800),
             value: form.crawlKeywordGapMs,
             source: srcText('crawlKeywordGapMs'),
@@ -344,7 +408,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: '等扫码登录（秒）',
-            note: '留空 = 180。抖音/快手首次要扫码，超时后任务转为「等你处理」，可以 resume 续跑',
+            note: '留空 = 180 秒，超时转「等你处理」',
             placeholder: String(Math.round((tuning.loginWaitMs || 180000) / 1000)),
             value: form.crawlLoginWaitSec,
             source: srcText('crawlLoginWaitSec'),
@@ -352,7 +416,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: '停滞多久断开重连（秒）',
-            note: '留空 = 15。连续这么久收不到数据就断开重连，别按体积估超时（会误杀慢连接）',
+            note: '留空 = 15 秒，无数据即重连',
             placeholder: String(Math.round((tuning.stallMs || 15000) / 1000)),
             value: form.crawlStallSec,
             source: srcText('crawlStallSec'),
@@ -360,7 +424,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: '单条下载总预算（秒）',
-            note: '留空 = 300。超过就放弃并记 failed，不拖住整批',
+            note: '留空 = 300 秒，超时记 failed',
             placeholder: String(Math.round((tuning.totalMs || 300000) / 1000)),
             value: form.crawlDownloadTimeoutSec,
             source: srcText('crawlDownloadTimeoutSec'),
@@ -368,36 +432,57 @@ window.__ModuleLoader__.load({
           }),
           h(SwitchField, {
             label: '搜索时屏蔽图片/视频/字体',
-            note: '省带宽，但抖音是 SPA，开了会拿不到数据——只有在纯快手任务里才建议开',
+            note: '抖音开了会拿不到数据',
             source: srcText('crawlBlockMedia'),
             on: form.crawlBlockMedia === true,
             onChange: (v) => setKey('crawlBlockMedia', v),
           })),
 
-        h(Section, { title: '账号', sum: st.credential ? 'B站 凭证已找到' : 'B站 凭证未找到（匿名 480P）' },
+        h(Section, { title: '账号与登录', sum: acctSum },
+          h('div', { 'data-vd-acct': '' },
+            h('div', { 'data-vd-acct-row': '' },
+              h('b', null, 'B站'),
+              h('span', { 'data-vd-badge': st.credential ? 'ok' : '' }, st.credential ? '凭证已找到' : '未找到（匿名 480P）')),
+            h('div', { 'data-vd-acct-row': '' },
+              h('b', null, '快手'),
+              h('span', { 'data-vd-badge': profiles.kuaishou?.exists ? 'ok' : '' },
+                acctOf('kuaishou')),
+              h('button', {
+                'data-vd-btn': '',
+                type: 'button',
+                disabled: loginBusy === 'kuaishou',
+                onClick: () => doLogin('kuaishou'),
+              }, loginBusy === 'kuaishou' ? '等待扫码…' : '扫码登录')),
+            h('div', { 'data-vd-acct-row': '' },
+              h('b', null, '抖音'),
+              h('span', { 'data-vd-badge': profiles.douyin?.exists ? 'ok' : '' },
+                acctOf('douyin')),
+              h('button', {
+                'data-vd-btn': '',
+                type: 'button',
+                disabled: loginBusy === 'douyin',
+                onClick: () => doLogin('douyin'),
+              }, loginBusy === 'douyin' ? '等待扫码…' : '扫码登录'))),
           h(SwitchField, {
-            label: '读取本机 B 站登录凭证',
-            note: '关掉 = 纯匿名，最高只到 480P；凭证内容不进面板，这里只存路径',
+            label: '读取本机 B 站凭证',
+            note: '关掉 = 匿名（最高 480P）',
             source: srcText('biliUseCredential'),
             on: form.biliUseCredential !== false,
             onChange: (v) => setKey('biliUseCredential', v),
           }),
           h(TextField, {
-            label: 'B站 凭证文件路径',
-            note: '留空 = 按顺序自动查找（DSH_BILI_CREDENTIAL → %APPDATA%\\dsh-desktop\\harness\\bili-duty → $DSH_HOME / ~/.dsh）',
+            label: 'B站 凭证路径',
+            note: '留空自动查找',
             placeholder: st.credential || '自动查找',
             value: form.biliCredentialPath,
             source: srcText('biliCredentialPath'),
             onChange: (v) => setKey('biliCredentialPath', v),
-          }),
-          h('div', { 'data-vd-hint': '' }, st.credential
-            ? '找到的凭证文件：' + st.credential
-            : '没找到凭证文件（此时自动退回匿名 480P）')),
+          })),
 
         h(Section, { title: '后端与代理', sum: (form.genericBackend || 'auto') + ' · ' + ((st.genericOrder && st.genericOrder.length) ? st.genericOrder.join(' → ') : '—') },
           h(SelectField, {
             label: '非 B站 站点后端顺序',
-            note: 'lux 只补 yt-dlp 没有的国内站（快手、腾讯视频、好看视频…），站点接口一改就失效，所以默认让它兜底；抖音固定走浏览器通路',
+            note: '默认让它兜底；抖音固定走浏览器',
             source: srcText('genericBackend'),
             value: form.genericBackend,
             options: BACKEND_OPTIONS,
@@ -408,7 +493,7 @@ window.__ModuleLoader__.load({
             + '；只有「这个后端干不了」才换下一个，要登录或被风控时直接报错'),
           h(TextField, {
             label: '代理',
-            note: '只作用于非 B站 站点（yt-dlp 与 lux 共用）；B站、快手、抖音强制直连。例：http://127.0.0.1:7890',
+            note: '非 B站 站点共用；B站/快手/抖音强制直连',
             placeholder: '留空 = 不用代理',
             value: form.ytdlpProxy,
             source: srcText('ytdlpProxy'),
@@ -418,7 +503,7 @@ window.__ModuleLoader__.load({
         h(Section, { title: '外部组件路径', sum: [st.ffmpeg, st.ytdlp, st.lux].filter(Boolean).length + ' / 3 已找到' },
           h(TextField, {
             label: 'ffmpeg',
-            note: '留空 = 自动探测；填错会退回自动探测，不会让下载直接失败',
+            note: '留空 = 自动探测',
             placeholder: st.ffmpeg || '自动探测',
             value: form.ffmpegPath,
             source: srcText('ffmpegPath'),
@@ -426,7 +511,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: 'yt-dlp',
-            note: '留空 = 自动探测；非 B站 站点（抖音、小红书、YouTube…）用它',
+            note: '留空 = 自动探测',
             placeholder: st.ytdlp || '自动探测',
             value: form.ytdlpPath,
             source: srcText('ytdlpPath'),
@@ -434,7 +519,7 @@ window.__ModuleLoader__.load({
           }),
           h(TextField, {
             label: 'lux',
-            note: '留空 = 自动探测（DSH_LUX_PATH → PATH → GOBIN → ~/go/bin）；只在 yt-dlp 干不了时被调用',
+            note: '留空 = 自动探测',
             placeholder: st.lux || '自动探测',
             value: form.luxPath,
             source: srcText('luxPath'),

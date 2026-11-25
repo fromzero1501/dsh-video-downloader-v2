@@ -2406,6 +2406,11 @@ async function settingsSnapshot({ probe = false } = {}) {
     crawlRoot: defaultCrawlRoot(),
     crawlFilters: normalizeCrawlFilters(currentCrawlFilters()),
     crawlTuning: crawlTuning(),
+    profiles: {
+      kuaishou: profileStateOf('kuaishou'),
+      douyin: profileStateOf('douyin'),
+    },
+    login: loginTask,
     credential: found,
     loggedIn: null,
   }
@@ -2561,6 +2566,13 @@ function registerSettingsRoute(ctx) {
         })
         return
       }
+      if (req.method === 'POST' && url.pathname === '/api/video-downloader/login') {
+        const body = await readJsonBody(req)
+        const platform = String(body?.platform || panelStr('crawlPlatform') || 'kuaishou').trim().toLowerCase()
+        const login = startLogin(platform)
+        sendJson(res, 200, { ok: true, login })
+        return
+      }
       sendJson(res, 404, { ok: false, error: '没有这个接口' })
     } catch (e) {
       sendJson(res, 500, { ok: false, error: String(e?.message ?? e) })
@@ -2662,6 +2674,138 @@ function registryOf() {
   return platformRegistry
 }
 
+// ------------------------------------------------------- 手动扫码登录（账号栏用）
+
+/** 每个平台登录态的「有没有 profile」近似：真正的有效性以下一次任务的接口返回为准。 */
+function profileStateOf(platform) {
+  const dir = join(stateDirOf(), platform, 'profile')
+  const saved = readAccounts()[platform] || null
+  try {
+    const st = statSync(dir)
+    return { exists: true, path: dir, updatedAt: st.mtimeMs, account: saved }
+  } catch {
+    return { exists: false, path: dir, account: saved }
+  }
+}
+
+function accountsPath() {
+  return join(stateDirOf(), 'accounts.json')
+}
+
+/** 各平台上次取到的登录账号（昵称/ID/头像），用于设置页显示。 */
+function readAccounts() {
+  try {
+    const j = JSON.parse(readFileSync(accountsPath(), 'utf8'))
+    return j && typeof j === 'object' ? j : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeAccounts(next) {
+  try {
+    mkdirSync(stateDirOf(), { recursive: true })
+    writeFileSync(accountsPath(), JSON.stringify(next, null, 2), 'utf8')
+  } catch {
+    /* 写不进去不影响主流程，下次再取 */
+  }
+}
+
+let loginTask = null
+
+/**
+ * 常驻浏览器会话：同一个平台只开一次浏览器，之后反复登录/取昵称都复用它。
+ * 用户明确要求「开着就别关」——不再用完即关，否则既反复闪窗，又要重撞 profile 锁。
+ */
+const liveSessions = new Map()
+
+async function liveSessionOf(key, adapter, opts) {
+  const hit = liveSessions.get(key)
+  if (hit) {
+    try {
+      await hit.session.readCookies?.()
+      return hit.session
+    } catch {
+      liveSessions.delete(key)
+      try {
+        await hit.session.close?.()
+      } catch {
+        /* 已经死了就算了 */
+      }
+    }
+  }
+  const session = await adapter.openSession(opts)
+  if (session) liveSessions.set(key, { session })
+  return session
+}
+
+async function closeLiveSessions() {
+  const all = [...liveSessions.values()]
+  liveSessions.clear()
+  await Promise.all(all.map(x => Promise.resolve(x.session?.close?.()).catch(() => {})))
+}
+
+/**
+ * 起一次扫码登录（异步）：立刻返回，前端轮询 /state 里的 status.login 看结果。
+ * 快手/抖音要开有头浏览器；B站 走本机凭证，不需要扫。
+ */
+function startLogin(platform) {
+  const key = String(platform || '').trim().toLowerCase()
+  const adapter = registryOf().get(key)
+  if (!adapter) throw new Error('不认识的平台：' + key)
+  if (!adapter.needsBrowser) {
+    return { platform: key, state: 'ok', message: '这个平台不用扫码（读本机凭证/匿名即可）' }
+  }
+  if (loginTask && loginTask.state === 'running') {
+    return { ...loginTask, already: true }
+  }
+  loginTask = { platform: key, state: 'running', message: '正在打开浏览器，请扫码…', startedAt: Date.now(), screenshot: '' }
+  const task = loginTask
+  const ac = new AbortController()
+  ;(async () => {
+    let session = null
+    try {
+      session = await liveSessionOf(key, adapter, { stateDir: stateDirOf(), log: () => {}, signal: ac.signal })
+      const r = await adapter.ensureLogin(session, {
+        stateDir: stateDirOf(),
+        jobId: 'manual-login',
+        log: () => {},
+        signal: ac.signal,
+        waitMs: 180000,
+        onNeedHuman: (info) => {
+          if (info?.screenshot) task.screenshot = info.screenshot
+          if (info?.message) task.message = info.message
+        },
+      })
+      if (r?.ok) {
+        task.state = 'ok'
+        task.message = '登录成功，登录态已保存'
+        try {
+          const acc = await adapter.account?.(session)
+          if (acc?.name) {
+            task.account = acc
+            writeAccounts({ ...readAccounts(), [key]: { ...acc, updatedAt: Date.now() } })
+            task.message = '登录成功：' + acc.name
+          }
+        } catch {
+          /* 取昵称失败不影响登录结果 */
+        }
+      } else {
+        task.state = 'failed'
+        task.message = r?.message || '登录没有完成'
+      }
+    } catch (e) {
+      task.state = 'failed'
+      task.message = String(e?.message ?? e)
+    } finally {
+      task.finishedAt = Date.now()
+      // 浏览器留着不关：同一个平台下次登录/取昵称直接复用，避免反复闪窗与 profile 锁。
+      if (!session) liveSessions.delete(key)
+    }
+  })()
+  return loginTask
+}
+
 /** 爬取管理器单例（浏览器 profile、任务状态目录都在 stateDir 下）。 */
 function crawlerOf() {
   const tuning = crawlTuning()
@@ -2674,6 +2818,8 @@ function crawlerOf() {
       platform: panelStr('crawlPlatform') || 'kuaishou',
       adapters: registryOf(),
       tuning,
+      // 复用设置页常驻的那个浏览器会话：同一个 profile 不能开两份，反复开关还会闪窗。
+      sessionProvider: (platformKey, adapter, opts) => liveSessionOf(platformKey, adapter, opts),
       // 快手偶尔只给 HLS 播放列表、B站 DASH 音视频分离，落盘后要用 ffmpeg 合并；惰性求值，缺 ffmpeg 时那条记失败而不是整任务崩
       ffmpeg: () => findFfmpeg(),
     })
