@@ -233,7 +233,8 @@ window.__ModuleLoader__.load({
       const [state, setState] = React.useState(null)
       const [form, setForm] = React.useState({})
       const [dirty, setDirty] = React.useState({})
-      const [busy, setBusy] = React.useState(false)
+      const [saving, setSaving] = React.useState(false)
+      const [savedAt, setSavedAt] = React.useState(0)
       const [msg, setMsg] = React.useState(null)
       const [fails, setFails] = React.useState(0)
       const [loginBusy, setLoginBusy] = React.useState('')
@@ -248,30 +249,67 @@ window.__ModuleLoader__.load({
         catch (e) { setFails((n) => n + 1); setMsg({ tone: 'warn', t: '读设置失败：' + String(e?.message ?? e) }) }
       }
       React.useEffect(() => { load(true) }, [])
-      // 只读状态（登录态要联网探一次）不跟着每次改动刷新，15 秒轮一次就够
+      // 定时只刷状态（探测 ffmpeg/登录态），不回灌表单，否则会把正在输入的内容冲掉
       React.useEffect(() => {
-        const t = setInterval(() => load(true), 15000)
+        const t = setInterval(async () => {
+          try { setState(await jget('/state?probe=1')); setFails(0) } catch (e) { setFails((n) => n + 1) }
+        }, 15000)
         return () => clearInterval(t)
       }, [])
 
-      const setKey = (k, v) => { setForm((f) => ({ ...f, [k]: v })); setDirty((d) => ({ ...d, [k]: true })) }
-      const dirtyCount = Object.keys(dirty).length
+      // ---- 实时保存：改动先进 pending，停手 500ms 就发一次；失败保留 pending 并自动重试
+      const timer = React.useRef(null)
+      const pending = React.useRef({})
+      React.useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
 
-      const save = async () => {
-        const patch = {}
-        for (const k of Object.keys(dirty)) patch[k] = form[k]
-        if (!Object.keys(patch).length) { setMsg({ tone: 'warn', t: '没有改动要保存' }); return }
-        setBusy(true); setMsg(null)
+      const flush = React.useCallback(async () => {
+        if (timer.current) { clearTimeout(timer.current); timer.current = null }
+        const patch = { ...pending.current }
+        const keys = Object.keys(patch)
+        if (!keys.length) return
+        pending.current = {}
+        setSaving(true)
         try {
           const j = await jpost('/config', { patch })
-          adopt(j)
+          setState(j)
+          setDirty((d) => {
+            const next = { ...d }
+            for (const k of keys) if (!(k in pending.current)) delete next[k]
+            return next
+          })
+          setSavedAt(Date.now())
           const bad = (j.warnings && j.warnings.length) ? j.warnings.join('；') : ''
-          setMsg(bad
-            ? { tone: 'warn', t: '已保存，但有需要注意的：' + bad }
-            : { tone: 'good', t: '已保存' + (j.persisted && j.persisted.length ? '：' + j.persisted.join('、') : '') + '（改完下一条命令就生效，不用重启）' })
+          setMsg(bad ? { tone: 'warn', t: bad } : null)
         } catch (e) {
-          setMsg({ tone: 'warn', t: '保存失败：' + String(e?.message ?? e) })
-        } finally { setBusy(false) }
+          // 把没存上的值放回去，3 秒后自动重试（期间用户继续改会合并进同一批）
+          for (const k of keys) if (!(k in pending.current)) pending.current[k] = patch[k]
+          setMsg({ tone: 'warn', t: '保存失败，正在重试：' + String(e?.message ?? e) })
+          timer.current = setTimeout(() => { flush() }, 3000)
+        } finally { setSaving(false) }
+      }, [])
+
+      const schedule = () => {
+        if (timer.current) clearTimeout(timer.current)
+        timer.current = setTimeout(() => { flush() }, 500)
+      }
+
+      const setKey = (k, v) => {
+        setForm((f) => ({ ...f, [k]: v }))
+        setDirty((d) => ({ ...d, [k]: true }))
+        pending.current[k] = v
+        schedule()
+      }
+      const dirtyCount = Object.keys(dirty).length
+
+      const clock = (ts) => {
+        const d = new Date(ts)
+        const p = (n) => String(n).padStart(2, '0')
+        return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+      }
+      // 「重新读取」先把手里的改动存掉，避免把刚敲的字冲掉
+      const reread = async () => {
+        await flush()
+        await load(true)
       }
 
       // ---- 扫码登录：起来后每 3 秒读一次 state，直到 status.login 不再是 running
@@ -299,10 +337,9 @@ window.__ModuleLoader__.load({
               setMsg(lg.state === 'ok'
                 ? { tone: 'good', t: '登录成功' + (lg.account?.name ? '：' + lg.account.name : '') }
                 : { tone: 'warn', t: '登录未完成：' + (lg.message || '超时') })
-              load(true)
+              try { setState(await jget('/state?probe=1')) } catch { /* 下一轮定时刷新兜 */ }
             }
-          } catch {
-            /* 网络抖动，继续等 */
+          } catch {            /* 网络抖动，继续等 */
           }
           if (Date.now() - started > 200000) {
             clearInterval(timer)
@@ -373,12 +410,12 @@ window.__ModuleLoader__.load({
           h(Chip, { tone: st.loggedIn === true ? 'ok' : null },
             st.loggedIn === true ? 'B站 已登录' : st.loggedIn === false ? 'B站 未登录（480P）' : 'B站 登录态未知'),
           h('div', { 'data-vd-grow': '' }),
-          dirtyCount ? h('span', { 'data-vd-hint': '' }, dirtyCount + ' 项未保存') : null,
-          h('button', {
-            'data-vd-btn': '', 'data-primary': '', 'data-dirty': dirtyCount ? '' : undefined,
-            disabled: busy, onClick: save,
-          }, busy ? '保存中…' : '保存'),
-          h('button', { 'data-vd-btn': '', disabled: busy, onClick: () => load(true) }, '重新读取')),
+          saving
+            ? h('span', { 'data-vd-hint': '' }, '保存中…')
+            : dirtyCount
+              ? h('span', { 'data-vd-hint': '' }, '待保存')
+              : savedAt ? h('span', { 'data-vd-hint': '' }, '已保存 ' + clock(savedAt)) : null,
+          h('button', { 'data-vd-btn': '', disabled: saving, onClick: reread }, '刷新')),
 
         msg ? h('div', {
           'data-vd-msg': '',
