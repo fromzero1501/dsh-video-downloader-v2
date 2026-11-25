@@ -3031,7 +3031,7 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'video_crawl',
     description:
-      '按关键词或作者主页批量爬取视频（异步任务，立刻返回 jobId）。目前支持快手（kuaishou）与 B站（bilibili）。' +
+      '按关键词或作者主页批量爬取视频（异步任务，立刻返回 jobId）。目前支持快手（kuaishou）、B站（bilibili）、抖音（douyin）。' +
       '落盘口径：<根>\\<平台中文名>\\<关键词或作者名>\\<标题 [视频id].mp4，根目录默认 D:\\500 工作\\视频爬取（设置页可改）。' +
       '两个入口：source=keyword（同词翻页到底，条数不够再用 synonyms 里的同义词逐个补搜）；' +
       'source=creator（给作者主页链接或 id，翻该作者的全部作品，目录名用接口返回的作者名）。' +
@@ -3045,7 +3045,7 @@ export function apply(ctx, config) {
       keyword: { type: 'string', description: '搜索关键词，同时作为落盘子目录名（source=keyword 时必填）。' },
       source: { type: 'string', description: '入口：keyword（关键词搜索，默认）/ creator（作者主页批量）。' },
       creator: { type: 'string', description: 'source=creator 时必填：作者主页链接或作者 id。目录名用接口返回的作者名。' },
-      platform: { type: 'string', description: '平台：kuaishou（快手）/ bilibili（B站）；留空用设置页的默认平台。' },
+      platform: { type: 'string', description: '平台：kuaishou（快手）/ bilibili（B站）/ douyin（抖音）；留空用设置页的默认平台，或从链接自动识别。' },
       limit: { type: 'number', description: '要下载多少条；不填默认 10 条。' },
       maxPages: { type: 'number', description: '每个关键词最多翻多少页（每页 20 条）；不填默认 10。' },
       synonyms: { type: 'array', items: { type: 'string' }, description: '可选：同义词/扩展词列表，主关键词搜不够 limit 时依次补搜。' },
@@ -3054,6 +3054,8 @@ export function apply(ctx, config) {
       minView: { type: 'number', description: '可选：最低播放量，覆盖设置页默认值。' },
       maxAgeDays: { type: 'number', description: '可选：只要最近 N 天内发布的，覆盖设置页默认值。' },
       concurrency: { type: 'number', description: '可选：同时下载几条，默认 6、上限 8。实测 6 并发聚合吞吐最高。' },
+      quality: { type: 'string', description: '可选：清晰度（best / worst / 112 / 80 / 64 / 32 / 16）。只对能从多个清晰度里挑的平台生效（B站），直链平台忽略。' },
+      incremental: { type: 'boolean', description: '可选：增量边界，默认开。连续几页都是已下过的作品就停止翻页，重复跑同一作者时能省掉大量请求。' },
     },
     output: OUTPUT,
     async execute(args) {
@@ -3077,6 +3079,8 @@ export function apply(ctx, config) {
           synonyms: args.synonyms,
           root: args.root,
           concurrency: args.concurrency,
+          quality: args.quality,
+          incremental: args.incremental,
           filters,
         })
         return JSON.stringify({

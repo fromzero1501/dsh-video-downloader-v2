@@ -126,6 +126,16 @@ export function normalizeCrawlFilters(raw = {}) {
 }
 
 /**
+ * 增量边界：连续多少页全是「索引里已经下过」的作品，就认为翻到了上次的尽头。
+ * 判据只数「没见过」的条数，不看筛选结果——否则一页被最低点赞全筛掉时会被误判成到底。
+ */
+export function reachedCrawlBoundary({ stalePages = 0, staleLimit = 3, incremental = true } = {}) {
+  if (incremental === false) return false
+  const limit = Math.max(1, Number(staleLimit) || 3)
+  return Number(stalePages) >= limit
+}
+
+/**
  * 把原始计时压成能直接看懂的摘要：页均/条均/最慢几条/单条平均速率。
  * 注意两件事：①下载是并发的，items 的 ms 之和会大于 downloadMs；
  * ②搜索和下载现在是流水线并行，searchMs 与 downloadMs 有重叠，两者相加大于墙钟。
@@ -181,7 +191,7 @@ export function pickDownloadTask({ cursor = 0, foundLength = 0, limit = 0, searc
 export function isRetryableDownloadError(message) {
   const text = String(message || '')
   if (/HTTP 4\d\d/.test(text)) return false
-  return /没有任何数据|响应被截断|单条超过|HTTP 5\d\d|fetch failed|socket|ECONNRESET|ETIMEDOUT|aborted/i.test(text)
+  return /没有任何数据|响应被截断|单条超过|HTTP 5\d\d|fetch failed|socket|ECONNRESET|ETIMEDOUT|aborted|terminated|other side closed|premature close|UND_ERR/i.test(text)
 }
 
 /** 单条连接「停滞」多久算卡死：连续这么久没有任何字节进来就断开重连。
@@ -293,9 +303,18 @@ export function refererFor(url) {
   return ''
 }
 
-async function downloadDirect(url, file, {
+export async function downloadDirect(url, file, {
   signal, backupUrls = [], ffmpeg, stallMs = DOWNLOAD_STALL_MS, totalMs = DOWNLOAD_TOTAL_MS, headers = {},
 } = {}) {
+  // .part 断点续传：中断留下的半截文件下次接着下，不再整条重来。
+  const part = `${file}.part`
+  const sizeOf = (p) => {
+    try {
+      return statSync(p).size
+    } catch {
+      return 0
+    }
+  }
   // referer 必须按目标主机的算：备用地址可能落在另一个 CDN 域上。
   const headersFor = (target) => {
     const ref = refererFor(target)
@@ -321,7 +340,24 @@ async function downloadDirect(url, file, {
       ? setTimeout(() => ctrl.abort(new Error(`单条超过 ${Math.round(totalMs / 1000)} 秒，放弃`)), totalMs)
       : null
     try {
-      const res = await fetch(target, { headers: headersFor(target), signal: ctrl.signal, redirect: 'follow' })
+      let have = sizeOf(part)
+      const request = (resume) => {
+        const h = headersFor(target)
+        if (resume > 0) h.range = `bytes=${resume}-`
+        return fetch(target, { headers: h, signal: ctrl.signal, redirect: 'follow' })
+      }
+      let res = await request(have)
+      // 416 不是错误：它表示「你要的起点超过了总长」，也就是上次其实已经下完。
+      if (have > 0 && res.status === 416) {
+        renameSync(part, file)
+        return sizeOf(file)
+      }
+      // 服务器不认 Range 时会回 200 整包，此时必须从头写，不能接在半截后面。
+      if (have > 0 && res.status !== 206) {
+        rmSync(part, { force: true })
+        have = 0
+        res = await request(0)
+      }
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`)
       // 类型闸门：拿到的不是视频就别存成 .mp4（踩过：把封面图存成了 mp4）。
       // mpegurl / text-plain 要放行——HLS-only 作品先落成播放列表，再由 readHead 认出 #EXTM3U 交给 ffmpeg 合并。
@@ -329,8 +365,12 @@ async function downloadDirect(url, file, {
       if (ctype && !/^video\/|octet-stream|mpegurl|^text\/plain/.test(ctype)) {
         throw new Error(`返回的不是视频（content-type: ${ctype}）`)
       }
-      const expect = Number(res.headers.get('content-length') || 0)
-      const ws = createWriteStream(file)
+      // 总长：续传响应看 content-range 的尾部（bytes a-b/total），整包响应看 content-length。
+      const crange = String(res.headers.get('content-range') || '')
+      const rangeTotal = Number((crange.match(/\/(\d+)\s*$/) || [])[1]) || 0
+      const lengthTotal = Number(res.headers.get('content-length') || 0)
+      const total = rangeTotal || (lengthTotal > 0 ? lengthTotal + have : 0)
+      const ws = createWriteStream(part, { flags: have > 0 ? 'a' : 'w' })
       let bytes = 0
       const src = Readable.fromWeb(res.body)
       src.on('data', (chunk) => { bytes += chunk.length; last = Date.now() })
@@ -341,8 +381,11 @@ async function downloadDirect(url, file, {
         src.pipe(ws)
       })
       // 响应被掐断时流会「正常」结束：只拿到一小截不能当成功（实测见过 15KB 就 finish）。
-      if (expect > 0 && bytes < expect) throw new Error(`只下到 ${bytes}/${expect} 字节，响应被截断`)
-      return bytes
+      if (total > 0 && have + bytes < total) {
+        throw new Error(`只下到 ${have + bytes}/${total} 字节，响应被截断`)
+      }
+      renameSync(part, file)
+      return sizeOf(file)
     } finally {
       clearInterval(watchdog)
       if (deadline) clearTimeout(deadline)
@@ -361,6 +404,10 @@ async function downloadDirect(url, file, {
       return bytes
     } catch (err) {
       lastErr = err
+      // 半截的 .part 留着，下次（或下一个候选）接着续；但如果拿回来的压根不是视频，那半截就是垃圾。
+      if (/返回的不是视频|HTTP 4\d\d/.test(String(err?.message || ''))) {
+        try { rmSync(part, { force: true }) } catch {}
+      }
       try { rmSync(file, { force: true }) } catch {}
       if (signal?.aborted) break
     }
@@ -391,6 +438,7 @@ export const CRAWL_TUNING_DEFAULTS = {
   stallMs: DOWNLOAD_STALL_MS,
   totalMs: DOWNLOAD_TOTAL_MS,
   blockMedia: false,     // 屏蔽图片/视频/字体请求（抖音开了会拿不到数据，默认关）
+  stalePages: 3,         // 连续这么多页全是已下过的，就判定翻到了上次的边界
 }
 
 export function createCrawler({
@@ -505,17 +553,28 @@ export function createCrawler({
     const absorb = (rows, label) => {
       const before = job.found.length
       job.stats.searched += rows.length
+      let unseen = 0
       for (const row of rows) {
+        // 「新」按索引判断，不受筛选影响：筛选挡掉的也算翻到了新内容，否则会被误判到底。
+        const isNew = !known(row.id)
+        if (isNew) unseen += 1
         if (seenLocal.has(row.id)) continue
         seenLocal.add(row.id)
         if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
         if (!adapter.canDownload(row)) { job.stats.noSource += 1; continue }
         job.found.push({ ...row, keyword: label })
-        if (!known(row.id)) fresh += 1
+        if (isNew) fresh += 1
       }
       job.stats.found = job.found.length
-      return { rows: rows.length, kept: job.found.length - before }
+      return { rows: rows.length, kept: job.found.length - before, unseen }
     }
+
+    /**
+     * 增量边界：连续若干页全是索引里已有的，说明已经翻到上次下过的旧内容。
+     * 作者主页按时间倒序，这个判据很准；关键词搜素按相关度排序，重复跑同一词时前三页就覆盖了主要结果。
+     */
+    const staleLimit = Math.max(1, Number(T.stalePages) || 3)
+    const reachedBoundary = (stalePages) => reachedCrawlBoundary({ stalePages, staleLimit, incremental: job.incremental })
 
     /** 限流退避返回 'retry'；需要人工的一律抛 PauseSignal 交给外层落状态。 */
     const handleVerdict = async (verdict) => {
@@ -549,6 +608,7 @@ export function createCrawler({
       const label = job.creatorName || job.creatorId || '作者主页'
       let pcursor = ''
       let pages = 0
+      let stalePages = 0
       const visited = new Set()
       while (pages < job.maxPages) {
         if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
@@ -566,6 +626,15 @@ export function createCrawler({
         })
         log(`作者主页第 ${pages + 1} 页拿到 ${counted.rows} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
         if (fresh >= job.limit) return true
+        // 整页都是已下过的 → 已经翻到上次的边界，没必要再往下翻。
+        if (counted.rows > 0) {
+          stalePages = counted.unseen > 0 ? 0 : stalePages + 1
+          if (reachedBoundary(stalePages)) {
+            job.boundaryHit = `连续 ${stalePages} 页都是已下过的作品`
+            log(`增量边界：${job.boundaryHit}，停止翻页`)
+            return fresh >= job.limit
+          }
+        }
         const next = res.nextCursor || ''
         if (!next || visited.has(next)) break
         visited.add(next)
@@ -582,6 +651,7 @@ export function createCrawler({
       let pcursor = ''
       let sessionId = ''
       let pages = 0
+      let stalePages = 0
       const visited = new Set()
 
       while (pages < job.maxPages) {
@@ -590,7 +660,6 @@ export function createCrawler({
         persist(job)
         // 每个环节都单独计时：这次的目标不是"能跑"，是"知道时间花在哪"。
         const pageStartedAt = Date.now()
-        const foundBefore = job.found.length
 
         const res = await adapter.searchKeyword(session, { keyword: word, cursor: pcursor, sessionId, signal })
         if (await handleVerdict(res.verdict) === 'retry') continue
@@ -607,6 +676,15 @@ export function createCrawler({
         log(`「${word}」第 ${pages + 1} 页拿到 ${counted.rows} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
 
         if (fresh >= job.limit) return true
+        // 同一个词连着几页全是已下过的 → 重复跑的这个词已经没什么新东西，换下一个词更划算。
+        if (counted.rows > 0) {
+          stalePages = counted.unseen > 0 ? 0 : stalePages + 1
+          if (reachedBoundary(stalePages)) {
+            job.boundaryHit = `「${word}」连续 ${stalePages} 页都是已下过的作品`
+            log(`增量边界：${job.boundaryHit}，换下一个关键词`)
+            break
+          }
+        }
         sessionId = res.searchSessionId || res.nextSessionId || sessionId
         const next = res.nextCursor || ''
         if (!next || visited.has(next)) break
@@ -672,7 +750,7 @@ export function createCrawler({
           // 平台自解析播放地址的（B站）走 adapter.download；直接给直链的（快手）走内置 downloadDirect。
           // 两种返回都接受：数字字节数，或 { savedTo, bytes }（B站下载器会自己决定文件名）。
           const res = adapter.download
-            ? await adapter.download(row, { file, dir: job.dir, signal, ffmpeg })
+            ? await adapter.download(row, { file, dir: job.dir, signal, ffmpeg, quality: job.quality || '' })
             : await downloadDirect(row.source.url, file, {
               signal, backupUrls: row.source.backupUrl, ffmpeg,
               stallMs: T.stallMs, totalMs: T.totalMs,
@@ -881,6 +959,8 @@ export function createCrawler({
         concurrency: Number(opts.concurrency) > 0 ? Math.max(1, Math.min(8, Math.floor(Number(opts.concurrency)))) : (T.concurrency || 6),
         filters,
         filterNotes,
+        incremental: opts.incremental !== false,
+        quality: opts.quality ? String(opts.quality) : '',
         status: 'queued',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -909,6 +989,7 @@ export function createCrawler({
         creatorId: job.creatorId || '',
         creatorName: job.creatorName || '',
         filterNotes: job.filterNotes || [],
+        boundaryHit: job.boundaryHit || '',
         status: job.status,
         dir: job.dir,
         limit: job.limit,

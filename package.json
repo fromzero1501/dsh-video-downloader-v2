@@ -1,6 +1,6 @@
 {
   "name": "dsh-video-downloader",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "DSH video downloader: Bilibili / Douyin / Kuaishou / generic backend (yt-dlp first, lux fallback), with keyword and creator batch crawl plus publish-time / like / view filters",
   "type": "module",
   "main": "src/index.js",

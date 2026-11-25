@@ -37,6 +37,7 @@ import {
 import {
   indexHit,
   absolutizePlaylist,
+  CRAWL_TUNING_DEFAULTS,
   DOWNLOAD_STALL_MS,
   isRetryableDownloadError,
   loadCrawlIndex,
@@ -44,6 +45,7 @@ import {
   passesCrawlFilter,
   pickDownloadTask,
   platformLabel,
+  reachedCrawlBoundary,
   refererFor,
   safeDirName,
   summarizeTimings,
@@ -682,6 +684,9 @@ test('download watchdog treats stalls and truncation as retryable, 4xx as not', 
   assert.equal(isRetryableDownloadError('单条超过 300 秒，放弃'), true)
   assert.equal(isRetryableDownloadError('HTTP 503 Service Unavailable'), true)
   assert.equal(isRetryableDownloadError('fetch failed'), true)
+  // 对端把连接掐了（undici 原样抛 terminated / other side closed）：也值得重连
+  assert.equal(isRetryableDownloadError('terminated'), true)
+  assert.equal(isRetryableDownloadError('other side closed'), true)
   // 客户端错误重连也没用
   assert.equal(isRetryableDownloadError('HTTP 403 Forbidden'), false)
   assert.equal(isRetryableDownloadError('HTTP 404 Not Found'), false)
@@ -918,5 +923,42 @@ test('cookieStringOf accepts Map, array and raw string', () => {
   assert.equal(cookieStringOf(null), '')
   assert.equal(fakeMsToken().length, 126)
   assert.match(fingerprintOf(), /^1536\|864\|1560\|944\|/)
+})
+
+test('bilibili adapter forwards the per-job quality and directory to the downloader', async () => {
+  const seen = []
+  const adapter = createBilibiliAdapter({
+    quality: 'best',
+    downloadBilibili: async (url, opts) => {
+      seen.push({ url, quality: opts.quality, outPath: opts.outPath })
+      return { savedTo: join(opts.outPath, 'x.mp4'), bytes: 1234, quality: '1080P', muxed: true }
+    },
+  })
+  // 任务级 quality 优先于 adapter 创建时的默认值。
+  const out = await adapter.download({ id: 'BV1xx411c7mD' }, { dir: 'D:\\tmp\\B站', quality: '112' })
+  assert.equal(seen[0].quality, '112')
+  assert.equal(seen[0].url, 'https://www.bilibili.com/video/BV1xx411c7mD')
+  assert.equal(seen[0].outPath, 'D:\\tmp\\B站')
+  assert.equal(out.bytes, 1234)
+  // 没给任务级 quality 时回落到 adapter 默认值。
+  await adapter.download({ id: 'BV1xx411c7mD' }, { dir: 'D:\\tmp\\B站' })
+  assert.equal(seen[1].quality, 'best')
+})
+
+test('crawl tuning exposes the incremental boundary window', () => {
+  assert.equal(CRAWL_TUNING_DEFAULTS.stalePages, 3)
+  assert.equal(CRAWL_TUNING_DEFAULTS.concurrency, 6)
+  assert.equal(CRAWL_TUNING_DEFAULTS.blockMedia, false)
+})
+
+test('reachedCrawlBoundary trips only after N consecutive all-seen pages', () => {
+  assert.equal(reachedCrawlBoundary({ stalePages: 0 }), false)
+  assert.equal(reachedCrawlBoundary({ stalePages: 2 }), false)
+  assert.equal(reachedCrawlBoundary({ stalePages: 3 }), true)
+  // 关掉增量翻到底
+  assert.equal(reachedCrawlBoundary({ stalePages: 9, incremental: false }), false)
+  // 自定义窗口，且非法值回落 3
+  assert.equal(reachedCrawlBoundary({ stalePages: 1, staleLimit: 1 }), true)
+  assert.equal(reachedCrawlBoundary({ stalePages: 2, staleLimit: 0 }), false)
 })
 
