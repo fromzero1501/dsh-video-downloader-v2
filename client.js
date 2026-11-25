@@ -64,6 +64,47 @@ window.__ModuleLoader__.load({
       ['douyin', '抖音'],
     ]
 
+    // 三个门槛都是固定档位（下拉），不用记数字；要精确值就在 video_crawl 里传参覆盖。
+    const LIKE_OPTIONS = [
+      ['', '不限'],
+      ['100', '100+'],
+      ['500', '500+'],
+      ['1000', '1000+'],
+      ['5000', '5000+'],
+      ['10000', '1 万+'],
+      ['50000', '5 万+'],
+    ]
+    const VIEW_OPTIONS = [
+      ['', '不限'],
+      ['1000', '1000+'],
+      ['5000', '5000+'],
+      ['10000', '1 万+'],
+      ['50000', '5 万+'],
+      ['100000', '10 万+'],
+      ['500000', '50 万+'],
+    ]
+    const AGE_OPTIONS = [
+      ['', '不限'],
+      ['1', '最近 1 天'],
+      ['3', '最近 3 天'],
+      ['7', '最近 7 天'],
+      ['15', '最近 15 天'],
+      ['30', '最近 30 天'],
+      ['90', '最近 90 天'],
+      ['365', '最近一年'],
+      ['1095', '最近 3 年'],
+    ]
+
+    // 设置键按平台分开存：crawlMinLikeKuaishou / crawlMinLikeBilibili / crawlMinLikeDouyin
+    const PLATFORM_SUFFIX = { kuaishou: 'Kuaishou', bilibili: 'Bilibili', douyin: 'Douyin' }
+    const filterKeyOf = (field, platform) => field + (PLATFORM_SUFFIX[platform] || 'Kuaishou')
+    // 接口不提供的数据：填了也没用，界面上直接置灰
+    const PLATFORM_LIMITS = {
+      kuaishou: {},
+      bilibili: { minLike: '作者主页接口不返回点赞，走作者入口时这一项会被自动忽略' },
+      douyin: { minView: '抖音搜索结果不提供播放量，这一项对抖音无效' },
+    }
+
     const CSS = `
 [data-vd-page]{display:flex;flex-direction:column;gap:12px;padding:2px 2px 28px;font-size:14px;line-height:1.55}
 [data-vd-top]{position:sticky;top:0;z-index:3;display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 0 10px;background:var(--bg-primary,canvas);border-bottom:1px solid rgba(127,127,127,.16)}
@@ -112,7 +153,14 @@ window.__ModuleLoader__.load({
 [data-vd-switch][data-on] [data-vd-dot]{background:#2ea043}
 [data-vd-foot]{font-size:12px;opacity:.5;padding:2px 2px 0}
 [data-vd-bad]{font-size:12px;opacity:.62;padding:8px 0}
-@media (max-width:720px){[data-vd-row]{grid-template-columns:minmax(0,1fr)}}
+[data-vd-tabs]{display:flex;gap:6px;margin:1px 0 4px}
+[data-vd-tab]{padding:5px 14px;border:1px solid rgba(127,127,127,.32);border-radius:999px;background:transparent;color:inherit;font:inherit;font-size:13px;cursor:pointer;transition:border-color .12s ease,background .12s ease}
+[data-vd-tab]:hover{background:rgba(127,127,127,.08)}
+[data-vd-tab][data-on]{border-color:rgba(80,140,255,.65);color:#3b82f6;background:rgba(80,140,255,.1)}
+[data-vd-input]:disabled{opacity:.42;cursor:not-allowed}
+[data-vd-flat]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+[data-vd-flat] [data-vd-filter]{gap:4px}
+@media (max-width:720px){[data-vd-row]{grid-template-columns:minmax(0,1fr)}[data-vd-filters],[data-vd-flat]{grid-template-columns:minmax(0,1fr)}}
 `
 
     /** 状态带里的一枚小胶囊。tone: ok | bad | null */
@@ -160,11 +208,12 @@ window.__ModuleLoader__.load({
       return h(Row, { label, note, source }, h(TextInput, { value, placeholder, onChange }))
     }
 
-    function SelectField({ label, note, source, value, options, onChange }) {
+    function SelectField({ label, note, source, value, options, disabled, onChange }) {
       return h(Row, { label, note, source },
         h('select', {
           'data-vd-input': '',
           value: value ?? options[0][0],
+          disabled: !!disabled,
           onChange: (e) => onChange(e.target.value),
         }, options.map(([v, text]) => h('option', { key: v, value: v }, text))))
     }
@@ -286,12 +335,16 @@ window.__ModuleLoader__.load({
       const src = state.sources || {}
       const srcText = (k) => src[k] === 'local' ? '来源：这一页' : src[k] === 'native' ? '来源：DSH 内置设置页' : '来源：默认值'
       const platformLabel = (id) => (PLATFORM_OPTIONS.find(([v]) => v === id) || [, id])[1]
-      const crawlRoot = form.crawlRoot || st.crawlRoot || 'D:\\500 工作\\视频爬取'
-      const filters = st.crawlFilters || {}
+      // 当前标签页 = 批量爬取的平台；接口不提供的项按 PLATFORM_LIMITS 置灰
+      const curPlatform = PLATFORM_SUFFIX[form.crawlPlatform] ? form.crawlPlatform : 'kuaishou'
+      const fk = (field) => filterKeyOf(field, curPlatform)
+      const limits = PLATFORM_LIMITS[curPlatform] || {}
+      const pf = (st.crawlFiltersByPlatform || {})[curPlatform] || st.crawlFilters || {}
       const filterText = [
-        filters.maxAgeDays > 0 ? '最近 ' + filters.maxAgeDays + ' 天' : '不限时间',
-        filters.minLike > 0 ? '点赞 ≥ ' + filters.minLike : '不限点赞',
-        filters.minView > 0 ? '播放 ≥ ' + filters.minView : '不限播放',
+        pf.maxAgeDays > 0 ? '最近 ' + pf.maxAgeDays + ' 天' : '不限时间',
+        pf.minLike > 0 ? '点赞 ≥ ' + pf.minLike : '不限点赞',
+        pf.minView > 0 ? '播放 ≥ ' + pf.minView : '不限播放',
+        '取 ' + (pf.limit || 10) + ' 条',
       ].join(' · ')
       // crawlTuning 里只有「用户真的填了值」的键才出现，其余交给内置默认，所以这里用默认值兜底显示。
       const tuning = st.crawlTuning || {}
@@ -333,15 +386,18 @@ window.__ModuleLoader__.load({
           'data-warn': msg.tone === 'warn' ? '' : undefined,
         }, msg.t) : null,
 
-        h(Section, { title: '下载落点与清晰度', open: true, sum: (st.downloadDir || '—') + ' · ' + (form.defaultQuality || 'best') },
+        h(Section, { title: '保存位置', open: true, sum: st.downloadDir || '—' },
           h(TextField, {
-            label: '默认下载目录',
-            note: '留空 = 系统下载目录',
+            label: '下载目录',
+            note: '单链接与批量都放这里，按平台分子目录',
             placeholder: st.downloadDir || '',
             value: form.downloadDir,
             source: srcText('downloadDir'),
             onChange: (v) => setKey('downloadDir', v),
           }),
+          h('div', { 'data-vd-hint': '' }, '落盘：<下载目录>\\<平台>\\<关键词 | 作者名 | 文件名>')),
+
+        h(Section, { title: '下载质量', open: true, sum: (QUALITY_OPTIONS.find(([v]) => v === form.defaultQuality) || [, 'best'])[1] },
           h(SelectField, {
             label: '默认清晰度',
             note: '达不到就自动降档，回报实际档位',
@@ -351,36 +407,94 @@ window.__ModuleLoader__.load({
             onChange: (v) => setKey('defaultQuality', v),
           })),
 
-        h(Section, { title: '批量爬取', open: true, sum: platformLabel(form.crawlPlatform || 'kuaishou') + ' · ' + filterText },
-          h(SelectField, {
-            label: '平台',
-            note: '关键词/作者主页批量都按它走',
-            source: srcText('crawlPlatform'),
-            value: form.crawlPlatform,
-            options: PLATFORM_OPTIONS,
-            onChange: (v) => setKey('crawlPlatform', v),
-          }),
+        h(Section, { title: '批量爬取', open: true, sum: platformLabel(curPlatform) + ' · ' + filterText },
+          h('div', { 'data-vd-tabs': '' },
+            ...PLATFORM_OPTIONS.map(([v, label]) => h('button', {
+              key: v,
+              type: 'button',
+              'data-vd-tab': '',
+              'data-on': curPlatform === v ? '' : undefined,
+              onClick: () => setKey('crawlPlatform', v),
+            }, label))),
           h(TextField, {
-            label: '爬取根目录',
-            note: '落盘：<根>\\<平台>\\<关键词或作者名>',
-            placeholder: crawlRoot,
-            value: form.crawlRoot,
-            source: srcText('crawlRoot'),
-            onChange: (v) => setKey('crawlRoot', v),
+            label: '默认抓取条数',
+            note: '留空 = 10 条；只说条数不说就是它',
+            placeholder: '10',
+            value: form[fk('crawlLimit')],
+            source: srcText(fk('crawlLimit')),
+            onChange: (v) => setKey(fk('crawlLimit'), v),
           }),
           h('div', { 'data-vd-hint': '' }, '下载前筛选：不达标的在搜索阶段就丢掉，不下载、不占磁盘'),
           h('div', { 'data-vd-filters': '' },
-            ...[
-              ['最近 N 天', '留空或 0 = 不限', 'crawlMaxAgeDays', '不限'],
-              ['最低点赞', '快手的「喜欢」等价于点赞', 'crawlMinLike', '不限'],
-              ['最低播放量', '留空或 0 = 不限', 'crawlMinView', '不限'],
-            ].map(([label, note, key, ph]) => h('div', { key, 'data-vd-filter': '' },
-              h('div', { 'data-vd-label': '' }, label),
-              h(TextInput, { placeholder: ph, value: form[key], onChange: (v) => setKey(key, v) }),
-              h('div', { 'data-vd-note': '' }, note))))),
+            h('div', { 'data-vd-filter': '' },
+              h('div', { 'data-vd-label': '' }, '最近发布'),
+              h('select', {
+                'data-vd-input': '',
+                value: form[fk('crawlMaxAgeDays')] ?? '',
+                onChange: (e) => setKey(fk('crawlMaxAgeDays'), e.target.value),
+              }, AGE_OPTIONS.map(([v, t]) => h('option', { key: v, value: v }, t)))),
+            h('div', { 'data-vd-filter': '' },
+              h('div', { 'data-vd-label': '' }, '最低点赞'),
+              h('select', {
+                'data-vd-input': '',
+                value: form[fk('crawlMinLike')] ?? '',
+                disabled: !!limits.minLike,
+                onChange: (e) => setKey(fk('crawlMinLike'), e.target.value),
+              }, LIKE_OPTIONS.map(([v, t]) => h('option', { key: v, value: v }, t))),
+              h('div', { 'data-vd-note': '' }, limits.minLike || '快手的「喜欢」等价于点赞')),
+            h('div', { 'data-vd-filter': '' },
+              h('div', { 'data-vd-label': '' }, '最低播放量'),
+              h('select', {
+                'data-vd-input': '',
+                value: form[fk('crawlMinView')] ?? '',
+                disabled: !!limits.minView,
+                onChange: (e) => setKey(fk('crawlMinView'), e.target.value),
+              }, VIEW_OPTIONS.map(([v, t]) => h('option', { key: v, value: v }, t))),
+              h('div', { 'data-vd-note': '' }, limits.minView || '低于它的不下载')))),
 
         // 进阶：默认收起。这里的值都能被 video_crawl 的单次传参覆盖。
-        h(Section, { title: '采集节奏与超时', open: false, sum: tunText },
+        h(Section, { title: '账号与登录', sum: acctSum },
+          h('div', { 'data-vd-acct': '' },
+            h('div', { 'data-vd-acct-row': '' },
+              h('b', null, 'B站'),
+              h('span', { 'data-vd-badge': st.credential ? 'ok' : '' }, st.credential ? '凭证已找到' : '未找到（匿名 480P）')),
+            h('div', { 'data-vd-acct-row': '' },
+              h('b', null, '快手'),
+              h('span', { 'data-vd-badge': profiles.kuaishou?.exists ? 'ok' : '' },
+                acctOf('kuaishou')),
+              h('button', {
+                'data-vd-btn': '',
+                type: 'button',
+                disabled: loginBusy === 'kuaishou',
+                onClick: () => doLogin('kuaishou'),
+              }, loginBusy === 'kuaishou' ? '等待扫码…' : '扫码登录')),
+            h('div', { 'data-vd-acct-row': '' },
+              h('b', null, '抖音'),
+              h('span', { 'data-vd-badge': profiles.douyin?.exists ? 'ok' : '' },
+                acctOf('douyin')),
+              h('button', {
+                'data-vd-btn': '',
+                type: 'button',
+                disabled: loginBusy === 'douyin',
+                onClick: () => doLogin('douyin'),
+              }, loginBusy === 'douyin' ? '等待扫码…' : '扫码登录'))),
+          h(SwitchField, {
+            label: '读取本机 B 站凭证',
+            note: '关掉 = 匿名（最高 480P）',
+            source: srcText('biliUseCredential'),
+            on: form.biliUseCredential !== false,
+            onChange: (v) => setKey('biliUseCredential', v),
+          }),
+          h(TextField, {
+            label: 'B站 凭证路径',
+            note: '留空自动查找',
+            placeholder: st.credential || '自动查找',
+            value: form.biliCredentialPath,
+            source: srcText('biliCredentialPath'),
+            onChange: (v) => setKey('biliCredentialPath', v),
+          })),
+
+        h(Section, { title: '排障', open: false, sum: tunText },
           h('div', { 'data-vd-hint': '' }, '留空 = 用内置默认值（括号里那个）。这些值决定「会不会被风控」和「一条卡住要等多久」，改之前先看右边说明。'),
           h(TextField, {
             label: '下载并发',
@@ -438,48 +552,7 @@ window.__ModuleLoader__.load({
             onChange: (v) => setKey('crawlBlockMedia', v),
           })),
 
-        h(Section, { title: '账号与登录', sum: acctSum },
-          h('div', { 'data-vd-acct': '' },
-            h('div', { 'data-vd-acct-row': '' },
-              h('b', null, 'B站'),
-              h('span', { 'data-vd-badge': st.credential ? 'ok' : '' }, st.credential ? '凭证已找到' : '未找到（匿名 480P）')),
-            h('div', { 'data-vd-acct-row': '' },
-              h('b', null, '快手'),
-              h('span', { 'data-vd-badge': profiles.kuaishou?.exists ? 'ok' : '' },
-                acctOf('kuaishou')),
-              h('button', {
-                'data-vd-btn': '',
-                type: 'button',
-                disabled: loginBusy === 'kuaishou',
-                onClick: () => doLogin('kuaishou'),
-              }, loginBusy === 'kuaishou' ? '等待扫码…' : '扫码登录')),
-            h('div', { 'data-vd-acct-row': '' },
-              h('b', null, '抖音'),
-              h('span', { 'data-vd-badge': profiles.douyin?.exists ? 'ok' : '' },
-                acctOf('douyin')),
-              h('button', {
-                'data-vd-btn': '',
-                type: 'button',
-                disabled: loginBusy === 'douyin',
-                onClick: () => doLogin('douyin'),
-              }, loginBusy === 'douyin' ? '等待扫码…' : '扫码登录'))),
-          h(SwitchField, {
-            label: '读取本机 B 站凭证',
-            note: '关掉 = 匿名（最高 480P）',
-            source: srcText('biliUseCredential'),
-            on: form.biliUseCredential !== false,
-            onChange: (v) => setKey('biliUseCredential', v),
-          }),
-          h(TextField, {
-            label: 'B站 凭证路径',
-            note: '留空自动查找',
-            placeholder: st.credential || '自动查找',
-            value: form.biliCredentialPath,
-            source: srcText('biliCredentialPath'),
-            onChange: (v) => setKey('biliCredentialPath', v),
-          })),
-
-        h(Section, { title: '后端与代理', sum: (form.genericBackend || 'auto') + ' · ' + ((st.genericOrder && st.genericOrder.length) ? st.genericOrder.join(' → ') : '—') },
+        h(Section, { title: '高级', open: false, sum: '后端顺序 · 代理 · 组件路径' },
           h(SelectField, {
             label: '非 B站 站点后端顺序',
             note: '默认让它兜底；抖音固定走浏览器',
@@ -498,9 +571,8 @@ window.__ModuleLoader__.load({
             value: form.ytdlpProxy,
             source: srcText('ytdlpProxy'),
             onChange: (v) => setKey('ytdlpProxy', v),
-          })),
-
-        h(Section, { title: '外部组件路径', sum: [st.ffmpeg, st.ytdlp, st.lux].filter(Boolean).length + ' / 3 已找到' },
+          }),
+          h('div', { 'data-vd-hint': '' }, '外部组件：' + [st.ffmpeg, st.ytdlp, st.lux].filter(Boolean).length + ' / 3 已找到（留空 = 自动探测）'),
           h(TextField, {
             label: 'ffmpeg',
             note: '留空 = 自动探测',

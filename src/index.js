@@ -28,7 +28,7 @@ import { createServer } from 'node:net'
 import { Readable } from 'node:stream'
 import { homedir, tmpdir } from 'node:os'
 import { loadSchemastery } from './hostdeps.js'
-import { createCrawler, normalizeCrawlFilters, platformLabel } from './crawl.js'
+import { CRAWL_DEFAULT_LIMIT, createCrawler, normalizeCrawlFilters, platformLabel } from './crawl.js'
 import { createPlatformRegistry, detectCrawlPlatform } from './platforms/index.js'
 
 export const name = 'dsh-video-downloader'
@@ -40,34 +40,43 @@ export const inject = ['tools']
 // 留空 = 没设（退回下一层），所以清空设置页不会让插件失效。
 const z = await loadSchemastery()
 
+// 批量爬取的门槛按平台各存一份：设置页用平台标签切换，改哪个平台就动哪个平台的键。
+// 三个平台能力不同（B站 作者入口没有点赞、抖音 搜索没有播放量），键仍然都留着，界面上按能力置灰。
+const CRAWL_PLATFORM_KEYS = ['kuaishou', 'bilibili', 'douyin']
+const CRAWL_FILTER_FIELDS = [
+  { key: 'crawlLimit', label: '默认抓取条数', hint: '留空 = 10 条' },
+  { key: 'crawlMinLike', label: '最低点赞', hint: '留空 = 不限' },
+  { key: 'crawlMinView', label: '最低播放量', hint: '留空 = 不限' },
+  { key: 'crawlMaxAgeDays', label: '最近发布天数', hint: '留空 = 不限' },
+]
+const capFirst = (s) => s.charAt(0).toUpperCase() + s.slice(1)
+function crawlFilterKey(field, platform) {
+  return `${field}${capFirst(platform)}`
+}
+const CRAWL_FILTER_KEYS = CRAWL_PLATFORM_KEYS.flatMap((p) => CRAWL_FILTER_FIELDS.map((f) => crawlFilterKey(f.key, p)))
+function crawlFilterDescription(key) {
+  for (const platform of CRAWL_PLATFORM_KEYS) {
+    for (const field of CRAWL_FILTER_FIELDS) {
+      if (crawlFilterKey(field.key, platform) === key) {
+        return `${platformLabel(platform)} 批量爬取的${field.label}（${field.hint}）`
+      }
+    }
+  }
+  return key
+}
+
 export const Config = !z
   ? undefined
   : z.object({
       downloadDir: z
         .string()
         .default('')
-        .description('默认下载目录；留空 = 系统 Downloads\\dsh-video-downloader')
+        .description('下载目录（单链接与批量爬取都落这里，按平台分子目录）；留空 = 系统 Downloads\\dsh-video-downloader')
         .extra('volatile', true),
-      crawlRoot: z
-        .string()
-        .default('')
-        .description('关键词爬取的根目录；留空 = D:\\500 工作\\视频爬取（按 <根>\\<平台>\\<关键词> 分层）')
-        .extra('volatile', true),
-      crawlMaxAgeDays: z
-        .string()
-        .default('')
-        .description('爬取筛选：只要最近 N 天内发布的视频（留空或 0 = 不限时间）')
-        .extra('volatile', true),
-      crawlMinLike: z
-        .string()
-        .default('')
-        .description('爬取筛选：最低点赞（=喜欢）数，低于它的不下载（留空或 0 = 不限）')
-        .extra('volatile', true),
-      crawlMinView: z
-        .string()
-        .default('')
-        .description('爬取筛选：最低播放量，低于它的不下载（留空或 0 = 不限）')
-        .extra('volatile', true),
+      ...Object.fromEntries(CRAWL_FILTER_KEYS.map((key) => [
+        key,
+        z.string().default('').description(crawlFilterDescription(key)).extra('volatile', true),
+      ])),
       crawlPlatform: z
         .string()
         .default('kuaishou')
@@ -160,10 +169,7 @@ export function setPanelConfig(config) {
 /** 可配置项与类型（设置页、路由、校验共用一张表）。 */
 const CONFIG_KEYS = {
   downloadDir: 'string',
-  crawlRoot: 'string',
-  crawlMaxAgeDays: 'string',
-  crawlMinLike: 'string',
-  crawlMinView: 'string',
+  ...Object.fromEntries(CRAWL_FILTER_KEYS.map((key) => [key, 'string'])),
   crawlPlatform: 'string',
   crawlConcurrency: 'string',
   crawlPageDelayMs: 'string',
@@ -185,10 +191,7 @@ const CONFIG_KEYS = {
 /** 每项的内置默认值（设置页读不到时的兜底，必须与 Config 的 .default() 保持一致）。 */
 const CONFIG_DEFAULTS = {
   downloadDir: '',
-  crawlRoot: '',
-  crawlMaxAgeDays: '',
-  crawlMinLike: '',
-  crawlMinView: '',
+  ...Object.fromEntries(CRAWL_FILTER_KEYS.map((key) => [key, ''])),
   crawlPlatform: 'kuaishou',
   crawlConcurrency: '',
   crawlPageDelayMs: '',
@@ -222,6 +225,34 @@ export function configFilePath() {
 
 let localMemo = { at: 0, mtime: -1, data: {} }
 
+let configMigrated = false
+
+/**
+ * 老配置迁移（每个进程只跑一次，写盘成功后旧键就没了，不会反复触发）：
+ * - 旧的 crawlRoot 合并进 downloadDir（落点统一成一个目录）。
+ * - 旧的全局 crawlMinLike / crawlMinView / crawlMaxAgeDays 归到当前平台名下，改成按平台各存一份。
+ * 返回迁移后的对象；没什么可迁的返回 null。
+ */
+function migrateLegacyConfig(data) {
+  const next = { ...data }
+  let changed = false
+  const text = (v) => (typeof v === 'string' ? v.trim() : '')
+  if ('crawlRoot' in next) {
+    if (text(next.crawlRoot) && !text(next.downloadDir)) next.downloadDir = next.crawlRoot
+    delete next.crawlRoot
+    changed = true
+  }
+  const platform = CRAWL_PLATFORM_KEYS.includes(text(next.crawlPlatform)) ? text(next.crawlPlatform) : 'kuaishou'
+  for (const field of ['crawlMinLike', 'crawlMinView', 'crawlMaxAgeDays']) {
+    if (!(field in next)) continue
+    const target = crawlFilterKey(field, platform)
+    if (!text(next[target]) && text(next[field])) next[target] = next[field]
+    delete next[field]
+    changed = true
+  }
+  return changed ? next : null
+}
+
 /** 读设置页存下的本地配置。按 mtime 失效，1 秒内复用（挡住页面 15 秒轮询之外的重读）。 */
 function readLocalConfig() {
   const file = configFilePath()
@@ -238,6 +269,20 @@ function readLocalConfig() {
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed
   } catch {
     data = {}
+  }
+  if (!configMigrated) {
+    configMigrated = true
+    const migrated = migrateLegacyConfig(data)
+    if (migrated) {
+      try {
+        mkdirSync(stateDirOf(), { recursive: true })
+        writeFileSync(file, JSON.stringify(migrated, null, 2) + '\n', 'utf8')
+        data = migrated
+        try { mtime = statSync(file).mtimeMs } catch { /* 保持原 mtime 也能用 */ }
+      } catch {
+        // 写不进去就只在本进程内用迁移后的值，下次启动再试
+      }
+    }
   }
   localMemo = { at: Date.now(), mtime, data }
   return data
@@ -745,15 +790,12 @@ export function defaultDownloadDir() {
 }
 
 /**
- * 爬取根目录：面板设置 → 环境变量 → 本机默认位置。
- * 关键词爬取与「未显式指定 outPath 的单链接下载」都落在这下面。
+ * 爬取根目录 = 下载目录（两者已合并成一个）。
+ * 单链接、关键词批量、作者主页批量都落在 <下载目录>\<平台名>\… 下。
+ * 保留这个函数名是为了不改动调用点；语义等同 defaultDownloadDir()。
  */
 export function defaultCrawlRoot() {
-  const fromPanel = panelStr('crawlRoot')
-  if (fromPanel) return resolve(fromPanel)
-  const env = process.env.DSH_CRAWL_ROOT
-  if (env && env.trim()) return resolve(env.trim())
-  return resolve('D:\\500 工作\\视频爬取')
+  return defaultDownloadDir()
 }
 
 /** 单链接下载的默认落点：<爬取根>\<平台中文名>。 */
@@ -2404,7 +2446,8 @@ async function settingsSnapshot({ probe = false } = {}) {
     genericOrder: genericBackendOrder(values.genericBackend),
     downloadDir: defaultDownloadDir(),
     crawlRoot: defaultCrawlRoot(),
-    crawlFilters: normalizeCrawlFilters(currentCrawlFilters()),
+    crawlFilters: crawlFiltersByPlatform()[String(values.crawlPlatform || 'kuaishou').toLowerCase()] || crawlFiltersByPlatform().kuaishou,
+    crawlFiltersByPlatform: crawlFiltersByPlatform(),
     crawlTuning: crawlTuning(),
     profiles: {
       kuaishou: profileStateOf('kuaishou'),
@@ -2450,17 +2493,10 @@ function applySettingsPatch(patch) {
           warnings.push('下载目录建不出来（可能没权限）：' + text)
         }
       }
-      if (key === 'crawlRoot' && text) {
-        try {
-          mkdirSync(resolve(text), { recursive: true })
-        } catch {
-          warnings.push('爬取根目录建不出来（可能没权限）：' + text)
-        }
-      }
-      if (['crawlMaxAgeDays', 'crawlMinLike', 'crawlMinView'].includes(key) && text) {
+      if (CRAWL_FILTER_KEYS.includes(key) && text) {
         const n = Number(text)
         if (!Number.isFinite(n) || n < 0) throw new Error(`${key} 需要一个 ≥ 0 的数字`)
-        warnings.push(`${key} = ${n}（0 表示不限）`)
+        if (key.startsWith('crawlLimit') && n > 5000) throw new Error('默认抓取条数最多 5000')
       }
       // 采集节奏：都是「留空 = 内置默认」，所以只校验非空的那些。
       if (['crawlConcurrency', 'crawlPageDelayMs', 'crawlKeywordGapMs', 'crawlLoginWaitSec', 'crawlStallSec', 'crawlDownloadTimeoutSec'].includes(key) && text) {
@@ -2651,13 +2687,34 @@ function crawlTuning() {
   }
 }
 
-/** 设置页里的三个筛选值，空串表示不限。 */
-function currentCrawlFilters() {
+/**
+ * 某个平台的批量筛选（设置页按平台各存一份）。
+ * 空串表示不限；limit 交给 crawl 的默认值兜底，所以这里给 0 表示「没设」。
+ */
+function currentCrawlFilters(platform) {
+  const key = CRAWL_PLATFORM_KEYS.includes(String(platform || '').toLowerCase())
+    ? String(platform).toLowerCase()
+    : 'kuaishou'
   return {
-    maxAgeDays: panelStr('crawlMaxAgeDays'),
-    minLike: panelStr('crawlMinLike'),
-    minView: panelStr('crawlMinView'),
+    limit: panelStr(crawlFilterKey('crawlLimit', key)),
+    maxAgeDays: panelStr(crawlFilterKey('crawlMaxAgeDays', key)),
+    minLike: panelStr(crawlFilterKey('crawlMinLike', key)),
+    minView: panelStr(crawlFilterKey('crawlMinView', key)),
   }
+}
+
+/** 三个平台各自的那一份，给设置页一次看全（界面自己挑当前标签页显示）。 */
+function crawlFiltersByPlatform() {
+  const out = {}
+  for (const platform of CRAWL_PLATFORM_KEYS) {
+    const raw = currentCrawlFilters(platform)
+    const limit = Number(String(raw.limit ?? '').trim())
+    out[platform] = {
+      ...normalizeCrawlFilters(raw),
+      limit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : CRAWL_DEFAULT_LIMIT,
+    }
+  }
+  return out
 }
 
 /** 平台适配器注册表（惰性：构造时不探测 ffmpeg）。 */
@@ -3032,10 +3089,11 @@ export function apply(ctx, config) {
     name: 'video_crawl',
     description:
       '按关键词或作者主页批量爬取视频（异步任务，立刻返回 jobId）。目前支持快手（kuaishou）、B站（bilibili）、抖音（douyin）。' +
-      '落盘口径：<根>\\<平台中文名>\\<关键词或作者名>\\<标题 [视频id].mp4，根目录默认 D:\\500 工作\\视频爬取（设置页可改）。' +
+      '落盘口径：<下载目录>\\<平台中文名>\\<关键词或作者名>\\<标题 [视频id].mp4（单链接下载落 <下载目录>\\<平台中文名>\\<文件名>）；' +
+      '下载目录在设置页配置，默认系统 Downloads\\dsh-video-downloader。' +
       '两个入口：source=keyword（同词翻页到底，条数不够再用 synonyms 里的同义词逐个补搜）；' +
       'source=creator（给作者主页链接或 id，翻该作者的全部作品，目录名用接口返回的作者名）。' +
-      '抓取前会按「最近 N 天发布 / 最低点赞（=喜欢）/ 最低播放量」筛选，不达标的直接跳过不下载；筛选值未传时用设置页里的默认值。' +
+      '抓取前会按「最近 N 天发布 / 最低点赞（=喜欢）/ 最低播放量」筛选，不达标的直接跳过不下载；筛选值未传时用设置页里该平台那一份（三个平台各存一份）。' +
       'B站作者主页接口不返回点赞量，走 creator 入口时会自动忽略最低点赞并在 filterNotes 里说明。' +
       '去重键是「平台+videoid」，索引里已有且文件还在盘的跳过，所以重复跑是增量。' +
       '遇到限流会退避重试；遇到验证码/风控会暂停任务并在 needHuman 里给出截图路径，等你人工处理后用 video_crawl_resume 续跑。' +
@@ -3062,20 +3120,28 @@ export function apply(ctx, config) {
     async execute(args) {
       try {
         const crawler = crawlerOf()
-        const filters = currentCrawlFilters()
-        for (const key of ['minLike', 'minView', 'maxAgeDays']) {
-          if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') filters[key] = args[key]
-        }
         // 平台可以显式给，也可以从链接里认出来；都没给就落到设置页默认平台。
+        // 先定平台，才能取「这个平台那一份」筛选默认值。
         const platform = String(args.platform || '').trim().toLowerCase()
           || detectCrawlPlatform(args.creator || args.keyword)
           || ''
+        const platformKey = platform || panelStr('crawlPlatform') || 'kuaishou'
+        const stored = currentCrawlFilters(platformKey)
+        const filters = normalizeCrawlFilters(stored)
+        for (const key of ['minLike', 'minView', 'maxAgeDays']) {
+          if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') filters[key] = args[key]
+        }
+        // 条数：显式优先，其次这个平台设置页里存的，最后交给 crawl 的默认值。
+        const storedLimit = Number(String(stored.limit ?? '').trim())
+        const limit = args.limit !== undefined && args.limit !== null && String(args.limit).trim() !== ''
+          ? args.limit
+          : (Number.isFinite(storedLimit) && storedLimit > 0 ? storedLimit : undefined)
         const job = crawler.start({
           platform: platform || undefined,
           source: args.source,
           creator: args.creator,
           keyword: args.keyword,
-          limit: args.limit,
+          limit,
           maxPages: args.maxPages,
           synonyms: args.synonyms,
           root: args.root,
