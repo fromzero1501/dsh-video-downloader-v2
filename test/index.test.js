@@ -54,6 +54,8 @@ import {
   kuaishouPickSource,
   kuaishouVerdict,
 } from '../src/kuaishou.js'
+import { createPlatformRegistry, detectCrawlPlatform } from '../src/platforms/index.js'
+import { BILI_DM_PARAMS, biliRow, cleanBiliTitle, createBilibiliAdapter, wbiSign } from '../src/platforms/bilibili.js'
 
 // Minimal ctx: enough for `apply` to register tools and for the pure tools to run.
 function mockCtx() {
@@ -194,9 +196,10 @@ test('apply registers every tool with valid JSON-Schema parameters', () => {
     'video_quality_parse',
     'video_resolve',
   ])
-  // 下载类工具必填 url；爬取类必填 keyword / jobId（status 全可选）
+  // 下载类工具必填 url；爬取类必填 jobId。video_crawl 的 keyword/creator 二选一，
+  // 由 execute 里按 source 校验，schema 上不设 required（否则 creator 入口会缺参）。
   const requiredByTool = {
-    video_crawl: ['keyword'],
+    video_crawl: [],
     video_crawl_cancel: ['jobId'],
     video_crawl_resume: ['jobId'],
     video_crawl_status: [],
@@ -670,4 +673,52 @@ test('download watchdog treats stalls and truncation as retryable, 4xx as not', 
   assert.equal(isRetryableDownloadError('HTTP 403 Forbidden'), false)
   assert.equal(isRetryableDownloadError('HTTP 404 Not Found'), false)
   assert.equal(isRetryableDownloadError(''), false)
+})
+
+test('detectCrawlPlatform recognizes bilibili/kuaishou and refuses douyin', () => {
+  assert.equal(detectCrawlPlatform('https://www.bilibili.com/video/BV17h4y1r7JT'), 'bilibili')
+  assert.equal(detectCrawlPlatform('https://space.bilibili.com/3494363638270349/video'), 'bilibili')
+  assert.equal(detectCrawlPlatform('BV17h4y1r7JT'), 'bilibili')
+  assert.equal(detectCrawlPlatform('https://b23.tv/abc123'), 'bilibili')
+  assert.equal(detectCrawlPlatform('https://www.kuaishou.com/short-video/3xuabp7j6t8mevu'), 'kuaishou')
+  assert.equal(detectCrawlPlatform('https://v.kuaishou.com/abc'), 'kuaishou')
+  // 抖音通道还没实现：宁可返回空，也不让调用方以为能用
+  assert.equal(detectCrawlPlatform('https://www.douyin.com/video/7412'), '')
+  assert.equal(detectCrawlPlatform('随便一个关键词'), '')
+})
+
+test('platform registry exposes adapters and honors like-filter support', () => {
+  const registry = createPlatformRegistry({})
+  assert.deepEqual(registry.ids, ['kuaishou', 'bilibili'])
+  const bili = registry.get('bilibili')
+  assert.equal(bili.label, 'B站')
+  assert.equal(bili.needsBrowser, false)
+  // 作者主页接口不返回点赞 ⇒ 作者入口不能参与最低点赞筛选，否则整批被筛空
+  assert.equal(bili.supportsLikeFilter('creator'), false)
+  assert.equal(bili.supportsLikeFilter('keyword'), true)
+  assert.equal(registry.get('unknown'), null)
+  // 纯 HTTP 平台没有浏览器会话
+  assert.equal(typeof bili.openSession, 'function')
+  assert.equal(bili.resolveCreatorId('https://space.bilibili.com/3494363638270349/video').creatorId, '3494363638270349')
+  assert.equal(bili.resolveCreatorId('3494363638270349').creatorId, '3494363638270349')
+  assert.equal(bili.resolveCreatorId('https://www.bilibili.com/video/BV17h4y1r7JT'), null)
+})
+
+test('bilibili wbi signing and row mapping keep the fields crawl needs', () => {
+  const { signedQuery } = wbiSign('ea1db124af3c7062474693fa704f4ff8', { keyword: '大枣', page: 1 }, 1700000000)
+  assert.match(signedQuery, /^keyword=%E5%A4%A7%E6%9E%A3&page=1&wts=1700000000&w_rid=[0-9a-f]{32}$/)
+  // 值里的 !'()* 直接剔除（不是百分号编码），空格变 +，~ 编码成 %7E
+  const tricky = wbiSign('k', { q: "a!b'c(d)e*f g~h" }, 1).signedQuery
+  assert.match(tricky, /^q=abcdef\+g%7Eh&wts=1&w_rid=[0-9a-f]{32}$/)
+  assert.ok(BILI_DM_PARAMS.dm_img_list)
+
+  assert.equal(cleanBiliTitle('<em class="keyword">大枣</em> 怎么吃'), '大枣 怎么吃')
+  const row = biliRow({ bvid: 'BV17h4y1r7JT', title: 'x', author: 'a', mid: 42, play: 12000, like: 7, pubdate: 1691243215, duration: '09:52' }, { keyword: '大枣' })
+  assert.equal(row.id, 'BV17h4y1r7JT')
+  assert.equal(row.mid, '42')
+  assert.equal(row.viewCount, 12000)
+  assert.equal(row.timestampMs, 1691243215000)
+  assert.equal(row.durationMs, 592000)
+  // 作者主页返回的作品没有 like 字段：保持 undefined，不要补 0（否则会被最低点赞筛掉）
+  assert.equal(biliRow({ bvid: 'BV1Ko4izNEvn', title: 't', created: 1760514994, length: '01:26' }, { source: 'creator' }).likeCount, undefined)
 })

@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链接就能下载，不需要先拿到直链。
 
-面向 **DSH 0.2.1-rc.2** 重写，四条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底），快手另有关键词批量爬取（本地浏览器拿签名 → 搜索接口翻页 → CDN 直链下载，不需要 yt-dlp / lux）。
+面向 **DSH 0.2.1-rc.2** 重写，四条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底），批量爬取另有平台适配器（快手走本地浏览器拿签名 → 搜索接口翻页 → CDN 直链下载；B站走纯 HTTP + wbi 签名）。
 
 ## 功能
 
@@ -12,7 +12,7 @@ DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链�
 | `video_resolve` | 把页面链接解析成流清单，不下载：B 站走内置解析，抖音走本地浏览器通路，其他站点走通用后端（yt-dlp → lux） |
 | `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；抖音用本地浏览器取播放流直下；其他站点页面链接交给通用后端（yt-dlp → lux） |
 | `video_quality_parse` | 从 URL 参数推断画质与容器格式，纯本地计算 |
-| `video_crawl` | 按关键词批量爬取快手视频（异步任务，立刻返回 `jobId`）：落盘到 `<根>\快手\<关键词>\`，下载前按「最近 N 天发布 / 最低点赞 / 最低播放量」筛选，索引去重，重复跑是增量 |
+| `video_crawl` | 批量爬取（异步任务，立刻返回 `jobId`）：`keyword` 按关键词、`creator` 按作者主页，`platform` 不给就按链接自动判断（快手 / B站）。落盘 `<根>\<平台>\<关键词或作者名>\`，下载前按「最近 N 天发布 / 最低点赞 / 最低播放量」筛选，索引去重，重复跑是增量 |
 | `video_crawl_status` | 查爬取进度：`phase`（当前关键词 + 第几页）、`stats`（搜到/筛掉/已下/跳过/失败/字节）、`items`、`timings`（搜索/下载墙钟、页均、单条均、吞吐、最慢三条）、`needHuman`（暂停原因 + 二维码截图路径） |
 | `video_crawl_resume` | 人工处理完验证码 / 扫码后，从索引里已下载的条目之后继续跑 |
 | `video_crawl_cancel` | 取消任务（已下载的文件保留） |
@@ -27,6 +27,7 @@ video_download  { "url": "https://www.douyin.com/video/xxxx", "quality": "best" 
 video_download  { "url": "https://www.xiaohongshu.com/explore/xxxx", "cookies": "D:\\cookies.txt" }
 video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\clip.mp4" }
 video_crawl     { "keyword": "和田大枣", "limit": 50, "minLike": 100, "minView": 5000, "maxAgeDays": 30 }
+video_crawl     { "creator": "https://space.bilibili.com/3494363638270349/video", "limit": 30 }
 video_crawl_status { "jobId": "kuaishou-20261125-172248-b549" }
 ```
 
@@ -101,7 +102,20 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 找不到时不会静默失败：音视频分别落盘，返回值里 `muxed: false` 并给出合并命令；只有单条流的站点不需要 ffmpeg。
 
-## 关键词爬取（快手）
+## 批量爬取（快手 / B站）
+
+两个入口，两种落点：
+
+| 入口 | 调用 | 落盘 |
+| --- | --- | --- |
+| 关键词 | `video_crawl { "keyword": "和田大枣", "limit": 50 }` | `<爬取根>\<平台>\<关键词>\` |
+| 作者主页 | `video_crawl { "creator": "https://space.bilibili.com/3494363638270349/video", "limit": 30 }` | `<爬取根>\<平台>\<作者名>\` |
+
+`keyword` 与 `creator` 二选一；`platform` 不给时按链接/关键词自动判断（`bilibili.com`/`BV` 号 → bilibili，`kuaishou.com`/`kwai.com` → kuaishou）。抖音的批量通道还没实现，`detectCrawlPlatform` 故意不返回 douyin。
+
+平台差异全部落在 `src/platforms/<平台>.js` 的适配器里（`searchKeyword` / `listCreator` / `download` / `supportsLikeFilter` / `maxConcurrency`），`crawl.js` 只负责调度、筛选、去重、并发、续传、计时——加新平台不用动调度层。
+
+### 快手
 
 `video_crawl { "keyword": "和田大枣", "limit": 50 }` → 后台任务，落盘 `<爬取根>\快手\和田大枣\`。
 
@@ -134,6 +148,32 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 **索引命中不占额度**：重复跑同一个关键词时，索引里已经下过的会跳过，且**不占用 `limit` 计数**——否则第二次跑一个词只会补到一两条就宣布「够了」。
 
 **已知限制**：安全 cookie（`kwscode` / `kwssectoken`）大约 6 分钟轮换一次，所以登录态是靠持久 profile 里的浏览器会话维持的，不是靠抓一段 cookie 复制走；快手改签名算法就得跟着改（劫持点只有一个，改起来集中）。任务只在 DSH 进程活着时跑，进程重启后未完成的任务要手动 `video_crawl_resume`。另外单条速率取决于快手 CDN 的缓存状态，冷门作品可能只有 0.5–1.5 MB/s，小样本测出来的聚合速率不能当常态，只有几十条以上才看得出并发收益。
+
+### B站
+
+**纯 HTTP，不开浏览器**：`wbi` 签名在 Node 侧自己算——`GET /x/web-interface/nav` 拿 `wbi_img`（未登录会回 `-101`，但 `wbi_img` 照给），把 `img_url` / `sub_url` 的文件名段按官方 64 项重排表拼出 `mixin_key`，请求参数加秒级 `wts`、剔除 `!"()*`、按 key 排序、WHATWG 编码后取 `w_rid = md5(query + mixin_key)`。`mixin_key` 缓存 1 小时，签名失效（`-403`）时自动重取一次。
+
+| 入口 | 接口 | 分页 | 点赞 |
+| --- | --- | --- | --- |
+| 关键词 | `/x/web-interface/wbi/search/type`（`search_type=video`、`page_size=20`、`order=totalrank`） | 页码 `page`，`data.numPages` 封顶 | 有（`like`） |
+| 作者主页 | `/x/space/wbi/arc/search`（`ps=30`、`order=pubdate`） | 页码 `pn`，`data.page.count` 封顶 | **没有** |
+
+- 作者主页接口对匿名请求查得很严，**必须三样齐全**：`buvid3`/`buvid4` cookie（`/x/frontend/finger/spi` 现取，缓存 12 小时）、四个 `dm_*` 设备指纹参数、`space.bilibili.com` 的 referer。缺任一项直接 `412 request was banned`（四种组合的对照见 `probe-bili-space.mjs`，这个结论是实测出来的，不是猜的）。
+- 作者主页也不返回点赞，所以**作者入口不参与「最低点赞」筛选**（`supportsLikeFilter('creator') === false`）；你填了 `minLike` 也会被自动清零并在 `filterNotes` 里说明，否则整批会被筛空。缺失的字段保持 `undefined`，绝不补 0。
+- 请求自带 1.1–1.7 秒间隔排队（`BILI_MIN_GAP_MS`），下载并发上限 2——B站是按请求频率风控的，连打几次就 `-352 风控校验失败`，排队比事后重试划算。冷却期内任务会退避 8/16/32 秒后转 `paused_need_human`，等几分钟再 `video_crawl_resume` 即可。
+- 搜索结果的标题带 `<em class="keyword">…</em>` 高亮标签，落盘前会清掉；`duration` 是 `mm:ss` / `hh:mm:ss` 文本，转成毫秒。
+- 下载复用插件已有的 B站单链下载（DASH 选流 + ffmpeg 合并），所以 B站批量**需要 ffmpeg**。
+
+### 各平台对照
+
+| | 快手 | B站 |
+| --- | --- | --- |
+| 搜索通道 | 有头 Edge + 页面内现签名 | 纯 HTTP + wbi 签名 |
+| 登录 | 必须（首次扫码，持久 profile） | 不需要 |
+| 作者主页 | `/rest/v/profile/feed` | `/x/space/wbi/arc/search` |
+| 点赞筛选 | 有效 | 仅关键词入口有效 |
+| 下载 | 单文件 mp4 直链（HLS 才借 ffmpeg） | DASH 分离，需 ffmpeg |
+| 并发上限 | 6 | 2 |
 
 
 ## 抖音通路
@@ -178,6 +218,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | 通用后端顺序 | `auto` | `auto` = yt-dlp 优先、lux 兜底（推荐）/ `ytdlp` = 只用 yt-dlp / `lux` = lux 优先、yt-dlp 兜底。抖音固定不用 lux |
 | yt-dlp 代理 | 空 | 只作用于非 B 站站点（yt-dlp 与 lux 共用）；B 站 一律直连（抖音也强制直连）。关键词爬取也直连，不走这个代理 |
 | 爬取根目录 | 空 | 空 = `D:\500 工作\视频爬取`；单链接下载（未给 `outPath` 时）与关键词爬取都落在这下面，保存时自动创建 |
+| 批量爬取默认平台 | `kuaishou` | 只影响没显式传 `platform` 时的默认值；传了链接或 `platform` 参数以调用为准 |
 | 最近 N 天 | 空 | 空或 0 = 不限；只下载发布时间在最近 N 天内的（没有发布时间的数据在设了这个条件时算不合格） |
 | 最低点赞 | 空 | 空或 0 = 不限；快手的「喜欢」就是点赞 |
 | 最低播放量 | 空 | 空或 0 = 不限 |
@@ -195,6 +236,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - **直链媒体**：mp4 / m4s / webm / mkv / flv / ts 按扩展名与 Content-Type 判定，原生下载；m3u8 / mpd 是播放列表不是媒体本身，交给 yt-dlp 拉流合并，不再当成视频文件直接存盘。
 - **其他站点**：交给通用后端——yt-dlp 优先、lux 兜底，覆盖两者支持的站点（小红书、YouTube、Vimeo、快手、腾讯视频、好看视频等）。lux 的增量价值就是那几个 yt-dlp 没有的国内站；两边都有时仍由 yt-dlp 出手（适配与维护更好）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
 - **快手（关键词爬取）**：按关键词批量抓，落 `<根>\快手\<关键词>\`。走本地浏览器拿签名 + 网页搜索接口翻页 + CDN 直链下载，不需要 yt-dlp / lux；只有极少数只给 HLS 播放列表的作品才借 ffmpeg 合并。首次要扫码登录一次，cookie 由持久 profile 维持；直播、私密作品、需要付费的内容不处理。遇到验证码会被拦下等你人工处理，不会硬闯。
+- **B站（关键词 + 作者主页爬取）**：纯 HTTP + wbi 签名，不需要浏览器、不需要登录。关键词落 `<根>\B站\<关键词>\`，作者主页落 `<根>\B站\<作者名>\`；下载复用单链通路的 DASH 选流 + ffmpeg 合并。作者主页接口不返回点赞，该入口自动忽略「最低点赞」条件。风控（`-352`）按频率触发，冷却几分钟后 `video_crawl_resume` 续跑。
 - **不做**：DRM 内容、付费墙绕过。
 
 ## 安装
@@ -236,7 +278,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定，以及八个工具的注册与错误分支。当前 46 个用例。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（抖音故意不认）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞），以及八个工具的注册与错误分支。当前 49 个用例。
 
 ## 许可证
 

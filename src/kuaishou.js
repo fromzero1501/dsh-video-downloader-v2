@@ -18,6 +18,8 @@ import { join } from 'node:path'
 
 export const KS_ORIGIN = 'https://www.kuaishou.com'
 export const KS_FEED_PATH = '/rest/v/search/feed'
+/** 作者主页作品列表；参数与搜索不同（userId + pcursor），签名方式一致。 */
+export const KS_PROFILE_FEED_PATH = '/rest/v/profile/feed'
 export const KS_SEARCH_PAGE_SIZE = 20
 
 const EDGE_CANDIDATES = [
@@ -130,6 +132,28 @@ export function kuaishouFeeds(payload) {
     })
   }
   return rows
+}
+
+/**
+ * 把作者主页响应里的 feeds 归一化成爬取行。纯函数。
+ * 主页接口的外层容器各版本不一致（顶层 feeds / data.feeds / data.visionProfilePhotoList.feeds），
+ * 这里按可能的位置依次找，找不到就当空。
+ */
+export function kuaishouProfileFeeds(payload) {
+  const containers = [
+    payload,
+    payload?.data,
+    payload?.data?.visionProfilePhotoList,
+    payload?.data?.profileFeeds,
+  ]
+  let feeds = []
+  let pcursor = ''
+  for (const c of containers) {
+    if (!c || typeof c !== 'object') continue
+    if (!feeds.length && Array.isArray(c.feeds)) feeds = c.feeds
+    if (!pcursor && typeof c.pcursor === 'string') pcursor = c.pcursor
+  }
+  return { rows: kuaishouFeeds({ feeds }), pcursor }
 }
 
 /** 文件名：标题前 40 字 + 视频 id，保证同目录内唯一且可读。 */
@@ -246,23 +270,25 @@ export async function openKuaishouSession({ profileDir, log = () => {}, signal, 
       return map
     }
 
-    const searchOnce = async ({ keyword, pcursor = '', searchSessionId = '' }) => {
+    /**
+     * 通用签名 REST 调用：在页面上下文里让 __ks_realm 现算 __NS_hxfalcon，再 fetch。
+     * 签名绑定 requestBody，所以每个请求都要现签；重试不能复用旧签名。
+     */
+    const restOnce = async ({ path, body }) => {
       const script = `(async () => {
-        const body = { keyword: ${JSON.stringify(String(keyword))}, pcursor: ${JSON.stringify(String(pcursor || ''))},
-                       page: 'search', searchSessionId: ${JSON.stringify(String(searchSessionId || ''))} };
+        const body = ${JSON.stringify(body)};
         if (!window.__ks_realm) return JSON.stringify({ __noRealm: true });
         const sign = await new Promise((resolve, reject) => {
           window.__ks_realm.call('$encode', [
-            { url: '${KS_FEED_PATH}', query: { caver: 2 }, form: {}, requestBody: body },
+            { url: ${JSON.stringify(path)}, query: { caver: 2 }, form: {}, requestBody: body },
             { suc: (s) => resolve(s), err: (e) => reject(new Error(String(e))) }
           ]);
         });
-        const res = await fetch('${KS_FEED_PATH}?__NS_hxfalcon=' + sign + '&caver=2', {
+        const res = await fetch(${JSON.stringify(path)} + '?__NS_hxfalcon=' + encodeURIComponent(sign) + '&caver=2', {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body), credentials: 'include'
         });
-        const text = await res.text();
-        try { return text; } catch (e) { return JSON.stringify({ __parseFailed: true }); }
+        return await res.text();
       })()`
       const out = await evalP(script)
       if (typeof out !== 'string') return { __transport: 'evaluate_failed' }
@@ -273,11 +299,29 @@ export async function openKuaishouSession({ profileDir, log = () => {}, signal, 
       }
     }
 
+    const searchOnce = async ({ keyword, pcursor = '', searchSessionId = '' }) => restOnce({
+      path: KS_FEED_PATH,
+      body: {
+        keyword: String(keyword),
+        pcursor: String(pcursor || ''),
+        page: 'search',
+        searchSessionId: String(searchSessionId || ''),
+      },
+    })
+
+    /** 作者主页作品列表。pcursor 为空取首页。 */
+    const profileFeedOnce = async ({ userId, pcursor = '' }) => restOnce({
+      path: KS_PROFILE_FEED_PATH,
+      body: { userId: String(userId), pcursor: String(pcursor || ''), page: 'profile' },
+    })
+
     return {
       browserPath: bin,
       profileDir,
       hasRealm: realm,
       searchOnce,
+      profileFeedOnce,
+      restOnce,
       readCookies,
       hasLogin: async () => {
         const cookies = await readCookies()

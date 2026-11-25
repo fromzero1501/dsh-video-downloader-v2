@@ -27,7 +27,6 @@ import { execFile } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { randomBytes } from 'node:crypto'
-import { kuaishouFeeds, kuaishouFileName, kuaishouVerdict, openKuaishouSession } from './kuaishou.js'
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
@@ -348,11 +347,28 @@ class PauseSignal extends Error {
 
 /**
  * 爬取任务管理器。一个实例管若干 job；job 是异步跑的，start 立刻返回。
+ *
+ * 平台差异全部下放在 adapter 里（见 src/platforms/）。这里只管：
+ * 关键词/作者两条入口、筛选、去重索引、并发 6、停滞重连、HLS 回落、分环节计时。
  */
-export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', defaultFilters = {}, log = () => {}, ffmpeg = null }) {
+export function createCrawler({
+  stateDir,
+  defaultRoot,
+  platform = 'kuaishou',
+  defaultFilters = {},
+  log = () => {},
+  ffmpeg = null,
+  adapters = null,
+}) {
+  const defaultPlatform = String(platform || 'kuaishou').toLowerCase()
+  const adapterOf = (id) => {
+    const key = String(id || defaultPlatform).toLowerCase()
+    const found = adapters?.get?.(key)
+    if (!found) throw Object.assign(new Error(`不支持的平台：${key}`), { code: 'unsupported' })
+    return found
+  }
   const indexFile = crawlIndexPath(stateDir)
   const jobsDir = crawlDirName(stateDir)
-  const profileDir = join(stateDir, 'kuaishou', 'profile')
   const jobs = new Map()
   const aborts = new Map()
 
@@ -395,7 +411,10 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
     // 列表页只要概要：timings / found 这类大字段不进列表，否则状态文件一多就拖死。
     return rows.slice(0, limit).map((job) => ({
       id: job.id,
+      platform: job.platform,
+      source: job.source || 'keyword',
       keyword: job.keyword,
+      creatorName: job.creatorName || '',
       status: job.status,
       dir: job.dir,
       limit: job.limit,
@@ -405,11 +424,11 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
     }))
   }
 
-  function newJobId() {
+  function newJobId(platformKey = defaultPlatform) {
     const d = new Date()
     const p = (n) => String(n).padStart(2, '0')
     const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-    return `${platform}-${stamp}-${randomBytes(2).toString('hex')}`
+    return `${platformKey}-${stamp}-${randomBytes(2).toString('hex')}`
   }
 
   function setStatus(job, status, extra = {}) {
@@ -424,13 +443,81 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
    * 够不够数按「索引里还没有的」算：重复跑同一个词时，已下过的不占额度，
    * 否则它会以为搜够了，实际只补到一两条（索引命中在下载阶段还会再确认文件在不在盘）。
    */
-  async function searchPhase(job, session, signal, index) {
-    const words = [job.keyword, ...(job.synonyms || [])].filter(Boolean)
+  async function searchPhase(job, session, signal, index, adapter) {
     const seenLocal = new Set(job.found.map((x) => x.id))
-    const known = (id) => Boolean(index && index.has(`${platform}:${id}`))
+    const known = (id) => Boolean(index && index.has(`${job.platform}:${id}`))
     let fresh = job.found.filter((r) => !known(r.id)).length
     let rateHits = 0
 
+    /** 把一页结果并进 job.found；平台差异已经由 adapter 抹平。 */
+    const absorb = (rows, label) => {
+      const before = job.found.length
+      job.stats.searched += rows.length
+      for (const row of rows) {
+        if (seenLocal.has(row.id)) continue
+        seenLocal.add(row.id)
+        if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
+        if (!adapter.canDownload(row)) { job.stats.noSource += 1; continue }
+        job.found.push({ ...row, keyword: label })
+        if (!known(row.id)) fresh += 1
+      }
+      job.stats.found = job.found.length
+      return { rows: rows.length, kept: job.found.length - before }
+    }
+
+    /** 限流退避返回 'retry'；需要人工的一律抛 PauseSignal 交给外层落状态。 */
+    const handleVerdict = async (verdict) => {
+      if (verdict.kind === 'ok') { rateHits = 0; return 'ok' }
+      if (verdict.kind === 'need_login') throw new PauseSignal('login', verdict.message)
+      if (verdict.kind === 'captcha') throw new PauseSignal('captcha', verdict.message)
+      if (verdict.kind === 'rate_limited') {
+        rateHits += 1
+        if (rateHits >= 3) throw new PauseSignal('rate_limited', verdict.message)
+        log(`限流，等 ${8 * rateHits}s 再试`)
+        await sleep(8000 * rateHits)
+        return 'retry'
+      }
+      throw new PauseSignal('blocked', verdict.message)
+    }
+
+    const pageDelay = () => {
+      const minDelay = Number(process.env.DSH_KS_PAGE_DELAY_MS) || 1500
+      return minDelay + Math.floor(Math.random() * 1500)
+    }
+
+    // 作者主页入口：没有词表，一条游标翻到底
+    if (job.source === 'creator') {
+      const label = job.creatorName || job.creatorId || '作者主页'
+      let pcursor = ''
+      let pages = 0
+      const visited = new Set()
+      while (pages < job.maxPages) {
+        if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
+        job.phase = { word: label, page: pages + 1 }
+        persist(job)
+        const pageStartedAt = Date.now()
+        const res = await adapter.listCreator(session, { creatorId: job.creatorId, cursor: pcursor, signal })
+        if (await handleVerdict(res.verdict) === 'retry') continue
+        const counted = absorb(res.rows, label)
+        if (!job.creatorName && res.authorName) job.creatorName = res.authorName
+        persist(job)
+        job.timings.pages.push({
+          word: label, page: pages + 1, ms: Date.now() - pageStartedAt,
+          rows: counted.rows, kept: counted.kept, dropped: counted.rows - counted.kept,
+        })
+        log(`作者主页第 ${pages + 1} 页拿到 ${counted.rows} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
+        if (fresh >= job.limit) return true
+        const next = res.nextCursor || ''
+        if (!next || visited.has(next)) break
+        visited.add(next)
+        pcursor = next
+        pages += 1
+        await sleep(pageDelay())
+      }
+      return fresh >= job.limit
+    }
+
+    const words = [job.keyword, ...(job.synonyms || [])].filter(Boolean)
     for (let wi = 0; wi < words.length; wi++) {
       const word = words[wi]
       let pcursor = ''
@@ -446,54 +533,28 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         const pageStartedAt = Date.now()
         const foundBefore = job.found.length
 
-        const payload = await session.searchOnce({ keyword: word, pcursor, searchSessionId: sessionId })
-        if (payload?.__transport) {
-          throw new PauseSignal('transport', `页面内请求失败：${payload.__transport}`)
-        }
-        const verdict = kuaishouVerdict(payload?.result, payload?.error_msg)
-        if (verdict.kind === 'need_login') throw new PauseSignal('login', verdict.message)
-        if (verdict.kind === 'captcha') throw new PauseSignal('captcha', verdict.message)
-        if (verdict.kind === 'rate_limited') {
-          rateHits += 1
-          if (rateHits >= 3) throw new PauseSignal('rate_limited', verdict.message)
-          log(`限流，等 ${8 * rateHits}s 再试`)
-          await sleep(8000 * rateHits)
-          continue
-        }
-        if (verdict.kind !== 'ok') throw new PauseSignal('blocked', verdict.message)
-        rateHits = 0
-
-        const rows = kuaishouFeeds(payload)
-        job.stats.searched += rows.length
-        for (const row of rows) {
-          if (seenLocal.has(row.id)) continue
-          seenLocal.add(row.id)
-          if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
-          if (!row.source) { job.stats.noSource += 1; continue }
-          job.found.push({ ...row, keyword: word })
-          if (!known(row.id)) fresh += 1
-        }
-        job.stats.found = job.found.length
+        const res = await adapter.searchKeyword(session, { keyword: word, cursor: pcursor, sessionId, signal })
+        if (await handleVerdict(res.verdict) === 'retry') continue
+        const counted = absorb(res.rows, word)
         persist(job)
         job.timings.pages.push({
           word,
           page: pages + 1,
           ms: Date.now() - pageStartedAt,
-          rows: rows.length,
-          kept: job.found.length - foundBefore,
-          dropped: rows.length - (job.found.length - foundBefore),
+          rows: counted.rows,
+          kept: counted.kept,
+          dropped: counted.rows - counted.kept,
         })
-        log(`「${word}」第 ${pages + 1} 页拿到 ${rows.length} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
+        log(`「${word}」第 ${pages + 1} 页拿到 ${counted.rows} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
 
         if (fresh >= job.limit) return true
-        const next = typeof payload?.pcursor === 'string' ? payload.pcursor : ''
-        sessionId = typeof payload?.searchSessionId === 'string' ? payload.searchSessionId : sessionId
+        sessionId = res.nextSessionId || sessionId
+        const next = res.nextCursor || ''
         if (!next || visited.has(next)) break
         visited.add(next)
         pcursor = next
         pages += 1
-        const minDelay = Number(process.env.DSH_KS_PAGE_DELAY_MS) || 1500
-        await sleep(minDelay + Math.floor(Math.random() * 1500))
+        await sleep(pageDelay())
       }
     }
     return fresh >= job.limit
@@ -505,8 +566,12 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
    */
   async function downloadPhase(job, signal, ctx = {}) {
     const searchDone = typeof ctx.searchDone === 'function' ? ctx.searchDone : () => true
+    const adapter = adapterOf(job.platform)
     const index = loadCrawlIndex(indexFile)
-    const concurrency = Math.max(1, Math.min(8, Number(job.concurrency) || 6))
+    // 并发上限取两头：用户的（默认 6，clamp 1–8）和平台自己的（B站 2，撞风控划不来）。
+    const want = Math.max(1, Math.min(8, Number(job.concurrency) || 6))
+    const cap = Number(adapter?.maxConcurrency) > 0 ? Number(adapter.maxConcurrency) : 8
+    const concurrency = Math.max(1, Math.min(want, cap))
     let cursor = 0
     let attempted = 0
     let retried = 0
@@ -529,7 +594,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         const row = job.found[pick.index]
         if (!row) { await sleep(200); continue }
 
-        if (indexHit(index, platform, row.id)) {
+        if (indexHit(index, job.platform, row.id)) {
           job.stats.skipped += 1
           row.status = 'skipped'
           persist(job)
@@ -537,21 +602,27 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         }
         attempted += 1
 
-        const file = join(job.dir, kuaishouFileName(row.caption, row.id))
+        const file = join(job.dir, adapter.fileName(row))
         const itemStartedAt = Date.now()
         try {
           mkdirSync(job.dir, { recursive: true })
-          const bytes = await downloadDirect(row.source.url, file, {
-            signal, backupUrls: row.source.backupUrl, ffmpeg,
-          })
+          // 平台自解析播放地址的（B站）走 adapter.download；直接给直链的（快手）走内置 downloadDirect。
+          // 两种返回都接受：数字字节数，或 { savedTo, bytes }（B站下载器会自己决定文件名）。
+          const res = adapter.download
+            ? await adapter.download(row, { file, dir: job.dir, signal, ffmpeg })
+            : await downloadDirect(row.source.url, file, {
+              signal, backupUrls: row.source.backupUrl, ffmpeg,
+            })
+          const bytes = typeof res === 'object' && res !== null ? Number(res.bytes) || 0 : Number(res) || 0
+          const savedFile = typeof res === 'object' && res !== null && res.savedTo ? res.savedTo : file
           row.status = 'done'
-          row.file = file
+          row.file = savedFile
           row.bytes = bytes
           job.stats.downloaded += 1
           job.stats.bytes += bytes
           try {
             appendFileSync(indexFile, JSON.stringify({
-              platform, id: row.id, file, bytes, keyword: job.keyword,
+              platform: job.platform, id: row.id, file, bytes, keyword: job.keyword,
               caption: row.caption.slice(0, 80), author: row.author,
               at: new Date().toISOString(), jobId: job.id,
             }) + '\n', 'utf8')
@@ -593,23 +664,22 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
     try {
       job.startedAt = new Date().toISOString()
       setStatus(job, 'searching')
-      session = await openKuaishouSession({ profileDir, log, signal })
+      const adapter = adapterOf(job.platform)
+      session = await adapter.openSession({ stateDir, log, signal })
 
-      if (!(await session.hasLogin())) {
-        const qr = join(stateDir, 'kuaishou', `login-${job.id}.png`)
-        setStatus(job, 'waiting_login', { needHuman: { reason: 'login', at: new Date().toISOString(), qrPath: qr, message: '需要扫码登录快手' } })
-        await session.navigate('https://www.kuaishou.com/')
-        await sleep(2500)
-        const saved = await session.screenshot(qr)
-        if (saved) log(`已截登录二维码：${saved}`)
-        const deadline = Date.now() + 180000
-        let ok = false
-        while (Date.now() < deadline) {
-          if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
-          await sleep(3000)
-          if (await session.hasLogin()) { ok = true; break }
-        }
-        if (!ok) throw new PauseSignal('login', '等待扫码登录超时（3 分钟）')
+      // 登录保障交给平台自己：快手要扫码，B站匿名也能搜。需要人工时由 onNeedHuman 落 waiting_login。
+      const login = await adapter.ensureLogin(session, {
+        stateDir,
+        jobId: job.id,
+        log,
+        signal,
+        onNeedHuman: (info) => setStatus(job, 'waiting_login', { needHuman: info }),
+      })
+      if (!login.ok) {
+        if (login.reason === 'canceled') throw Object.assign(new Error('已取消'), { code: 'canceled' })
+        throw new PauseSignal(login.reason || 'login', login.message || '需要人工处理')
+      }
+      if (job.needHuman) {
         job.needHuman = null
         setStatus(job, 'searching')
         log('登录态已就绪，继续爬取')
@@ -623,7 +693,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
       const indexSnapshot = loadCrawlIndex(indexFile)
       const searchTask = (async () => {
         try {
-          await searchPhase(job, session, signal, indexSnapshot)
+          await searchPhase(job, session, signal, indexSnapshot, adapter)
         } catch (err) {
           searchErr = err
         } finally {
@@ -680,26 +750,59 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
   return {
     indexPath: indexFile,
     jobsDir,
-    profileDir,
+    profileDir: adapterOf(defaultPlatform).profileDir?.(stateDir) || join(stateDir, defaultPlatform, 'profile'),
 
     start(opts) {
-      const keyword = String(opts.keyword || '').trim()
-      if (!keyword) throw Object.assign(new Error('keyword 不能为空'), { code: 'bad_request' })
+      const platformKey = String(opts.platform || defaultPlatform).toLowerCase()
+      const adapter = adapterOf(platformKey)
+      const bad = (msg) => Object.assign(new Error(msg), { code: 'bad_request' })
+      const source = String(opts.source || 'keyword').toLowerCase() === 'creator' ? 'creator' : 'keyword'
       const limit = Number(opts.limit) > 0 ? Math.floor(Number(opts.limit)) : CRAWL_DEFAULT_LIMIT
       const maxPages = Number(opts.maxPages) > 0 ? Math.floor(Number(opts.maxPages)) : CRAWL_DEFAULT_MAX_PAGES
       const root = resolve(String(opts.root || defaultRoot || '').trim() || defaultRoot)
-      const dir = join(root, platformLabel(platform), safeDirName(keyword))
+
+      // 两条入口：关键词（可带同义词阶梯）与作者主页。目录都用「用户给的那个名字」。
+      let keyword = ''
+      let creatorId = ''
+      let creatorName = ''
+      let dirName = ''
+      if (source === 'creator') {
+        const raw = String(opts.creator || opts.keyword || '').trim()
+        if (!raw) throw bad('creator 不能为空')
+        const resolved = adapter.resolveCreatorId?.(raw)
+        if (!resolved) throw bad(`认不出这个作者主页：${raw}`)
+        creatorId = resolved.creatorId
+        creatorName = resolved.name || ''
+        dirName = safeDirName(creatorName || creatorId)
+      } else {
+        keyword = String(opts.keyword || '').trim()
+        if (!keyword) throw bad('keyword 不能为空')
+        dirName = safeDirName(keyword)
+      }
+
+      const dir = join(root, platformLabel(platformKey), dirName)
+      const filters = normalizeCrawlFilters({ ...defaultFilters, ...(opts.filters || {}), ...opts })
+      const filterNotes = []
+      // 作者入口不一定返回点赞量：硬套最低点赞会把整批筛空，这里显式降级并记一笔。
+      if (source === 'creator' && adapter.supportsLikeFilter && !adapter.supportsLikeFilter(source) && filters.minLike > 0) {
+        filterNotes.push(`该入口不返回点赞量，最低点赞 ${filters.minLike} 已忽略`)
+        filters.minLike = 0
+      }
       const job = {
-        id: newJobId(),
-        platform,
+        id: newJobId(platformKey),
+        platform: platformKey,
+        source,
         keyword,
+        creatorId,
+        creatorName,
         synonyms: Array.isArray(opts.synonyms) ? opts.synonyms.map((s) => String(s).trim()).filter(Boolean) : [],
         root,
         dir,
         limit,
         maxPages,
         concurrency: Number(opts.concurrency) > 0 ? Math.max(1, Math.min(8, Math.floor(Number(opts.concurrency)))) : 6,
-        filters: normalizeCrawlFilters({ ...defaultFilters, ...(opts.filters || {}), ...opts }),
+        filters,
+        filterNotes,
         status: 'queued',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -723,7 +826,11 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
       return {
         id: job.id,
         platform: job.platform,
+        source: job.source || 'keyword',
         keyword: job.keyword,
+        creatorId: job.creatorId || '',
+        creatorName: job.creatorName || '',
+        filterNotes: job.filterNotes || [],
         status: job.status,
         dir: job.dir,
         limit: job.limit,

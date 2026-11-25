@@ -29,6 +29,7 @@ import { Readable } from 'node:stream'
 import { homedir, tmpdir } from 'node:os'
 import { loadSchemastery } from './hostdeps.js'
 import { createCrawler, normalizeCrawlFilters, platformLabel } from './crawl.js'
+import { createPlatformRegistry, detectCrawlPlatform } from './platforms/index.js'
 
 export const name = 'dsh-video-downloader'
 export const inject = ['tools']
@@ -66,6 +67,11 @@ export const Config = !z
         .string()
         .default('')
         .description('爬取筛选：最低播放量，低于它的不下载（留空或 0 = 不限）')
+        .extra('volatile', true),
+      crawlPlatform: z
+        .string()
+        .default('kuaishou')
+        .description('关键词/作者批量爬取的默认平台：kuaishou（快手）/ bilibili（B站）')
         .extra('volatile', true),
       defaultQuality: z
         .string()
@@ -123,6 +129,7 @@ const CONFIG_KEYS = {
   crawlMaxAgeDays: 'string',
   crawlMinLike: 'string',
   crawlMinView: 'string',
+  crawlPlatform: 'string',
   defaultQuality: 'string',
   biliUseCredential: 'boolean',
   biliCredentialPath: 'string',
@@ -140,6 +147,7 @@ const CONFIG_DEFAULTS = {
   crawlMaxAgeDays: '',
   crawlMinLike: '',
   crawlMinView: '',
+  crawlPlatform: 'kuaishou',
   defaultQuality: 'best',
   biliUseCredential: true,
   biliCredentialPath: '',
@@ -2556,14 +2564,29 @@ function currentCrawlFilters() {
   }
 }
 
+/** 平台适配器注册表（惰性：构造时不探测 ffmpeg）。 */
+let platformRegistry = null
+function registryOf() {
+  if (!platformRegistry) {
+    platformRegistry = createPlatformRegistry({
+      resolveBilibili,
+      downloadBilibili,
+      ffmpeg: () => findFfmpeg(),
+      quality: panelStr('defaultQuality') || 'best',
+    })
+  }
+  return platformRegistry
+}
+
 /** 爬取管理器单例（浏览器 profile、任务状态目录都在 stateDir 下）。 */
 function crawlerOf() {
   if (!crawlerInstance) {
     crawlerInstance = createCrawler({
       stateDir: stateDirOf(),
       defaultRoot: defaultCrawlRoot(),
-      platform: 'kuaishou',
-      // 快手偶尔只给 HLS 播放列表，落盘后要用 ffmpeg 合并；惰性求值，缺 ffmpeg 时那条记失败而不是整任务崩
+      platform: panelStr('crawlPlatform') || 'kuaishou',
+      adapters: registryOf(),
+      // 快手偶尔只给 HLS 播放列表、B站 DASH 音视频分离，落盘后要用 ffmpeg 合并；惰性求值，缺 ffmpeg 时那条记失败而不是整任务崩
       ffmpeg: () => findFfmpeg(),
     })
   }
@@ -2773,16 +2796,21 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'video_crawl',
     description:
-      '按关键词批量爬取快手视频（异步任务，立刻返回 jobId）。落盘口径：<根>\\快手\\<用户输入的关键词>\\<标题 [视频id].mp4，' +
-      '根目录默认 D:\\500 工作\\视频爬取（设置页可改）。抓取前会按「最近 N 天发布 / 最低点赞（=喜欢）/ 最低播放量」筛选，' +
-      '不达标的直接跳过不下载；筛选值未传时用设置页里的默认值。' +
-      '搜索策略：先把同一个关键词翻页到底，条数还不够再用 synonyms 里的同义词逐个搜（同义词由调用方生成）。' +
+      '按关键词或作者主页批量爬取视频（异步任务，立刻返回 jobId）。目前支持快手（kuaishou）与 B站（bilibili）。' +
+      '落盘口径：<根>\\<平台中文名>\\<关键词或作者名>\\<标题 [视频id].mp4，根目录默认 D:\\500 工作\\视频爬取（设置页可改）。' +
+      '两个入口：source=keyword（同词翻页到底，条数不够再用 synonyms 里的同义词逐个补搜）；' +
+      'source=creator（给作者主页链接或 id，翻该作者的全部作品，目录名用接口返回的作者名）。' +
+      '抓取前会按「最近 N 天发布 / 最低点赞（=喜欢）/ 最低播放量」筛选，不达标的直接跳过不下载；筛选值未传时用设置页里的默认值。' +
+      'B站作者主页接口不返回点赞量，走 creator 入口时会自动忽略最低点赞并在 filterNotes 里说明。' +
       '去重键是「平台+videoid」，索引里已有且文件还在盘的跳过，所以重复跑是增量。' +
       '遇到限流会退避重试；遇到验证码/风控会暂停任务并在 needHuman 里给出截图路径，等你人工处理后用 video_crawl_resume 续跑。' +
-      '搜索（快手 API）与下载（CDN）并行进行，下载并发默认 6，所以 status 里的 searchMs 与 downloadMs 会重叠，两者相加大于总耗时为正常。' +
-      '返回 { ok, jobId, dir, status, limit, filters, indexPath }。',
+      '搜索与下载并行进行，下载并发默认 6，所以 status 里的 searchMs 与 downloadMs 会重叠，两者相加大于总耗时为正常。' +
+      '返回 { ok, jobId, platform, source, dir, status, limit, filters, filterNotes, indexPath }。',
     parameters: {
-      keyword: { type: 'string', required: true, description: '搜索关键词，同时作为落盘子目录名。' },
+      keyword: { type: 'string', description: '搜索关键词，同时作为落盘子目录名（source=keyword 时必填）。' },
+      source: { type: 'string', description: '入口：keyword（关键词搜索，默认）/ creator（作者主页批量）。' },
+      creator: { type: 'string', description: 'source=creator 时必填：作者主页链接或作者 id。目录名用接口返回的作者名。' },
+      platform: { type: 'string', description: '平台：kuaishou（快手）/ bilibili（B站）；留空用设置页的默认平台。' },
       limit: { type: 'number', description: '要下载多少条；不填默认 10 条。' },
       maxPages: { type: 'number', description: '每个关键词最多翻多少页（每页 20 条）；不填默认 10。' },
       synonyms: { type: 'array', items: { type: 'string' }, description: '可选：同义词/扩展词列表，主关键词搜不够 limit 时依次补搜。' },
@@ -2800,7 +2828,14 @@ export function apply(ctx, config) {
         for (const key of ['minLike', 'minView', 'maxAgeDays']) {
           if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') filters[key] = args[key]
         }
+        // 平台可以显式给，也可以从链接里认出来；都没给就落到设置页默认平台。
+        const platform = String(args.platform || '').trim().toLowerCase()
+          || detectCrawlPlatform(args.creator || args.keyword)
+          || ''
         const job = crawler.start({
+          platform: platform || undefined,
+          source: args.source,
+          creator: args.creator,
           keyword: args.keyword,
           limit: args.limit,
           maxPages: args.maxPages,
@@ -2812,10 +2847,16 @@ export function apply(ctx, config) {
         return JSON.stringify({
           ok: true,
           jobId: job.id,
+          platform: job.platform,
+          source: job.source,
+          keyword: job.keyword,
+          creatorId: job.creatorId,
+          creatorName: job.creatorName,
           dir: job.dir,
           status: job.status,
           limit: job.limit,
           filters: job.filters,
+          filterNotes: job.filterNotes,
           indexPath: crawler.indexPath,
           hint: '任务在后台跑；用 video_crawl_status 查进度，video_crawl_cancel 取消。',
         })
