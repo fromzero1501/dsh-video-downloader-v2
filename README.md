@@ -26,7 +26,7 @@ video_download  { "url": "https://www.bilibili.com/video/BV1GJ411x7h7" }
 video_download  { "url": "https://www.douyin.com/video/xxxx", "quality": "best" }
 video_download  { "url": "https://www.xiaohongshu.com/explore/xxxx", "cookies": "D:\\cookies.txt" }
 video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\clip.mp4" }
-video_crawl     { "keyword": "和田大枣", "limit": 50, "minLike": 100, "minView": 5000, "maxAgeDays": 30 }
+video_crawl     { "keyword": "和田大枣", "limit": 50, "minLike": 100, "minView": 5000, "maxAgeDays": 30, "sort": "most_liked" }
 video_crawl     { "creator": "https://space.bilibili.com/3494363638270349/video", "limit": 30 }
 video_crawl_status { "jobId": "kuaishou-20261125-172248-b549" }
 ```
@@ -205,6 +205,8 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 **清晰度按任务给**：`video_crawl { "quality": "112" }` 只对能从多个清晰度里挑的平台生效（B站，可选 `best` / `worst` / `112` / `80` / `64` / `32` / `16`）；快手与抖音是单文件直链，给了也忽略。
 
+**排序**：`video_crawl { "sort": "latest" }`（最新）或 `"most_liked"`（最多点赞），默认 `default` 走接口原序。抖音带 `sort_type=1/2`、B站带 `order=pubdate`（它没有点赞排序，`most_liked` 保持综合排序再由调度层按点赞降序）、快手搜索接口没有排序字段，只在页内按统一口径排。**排序是页内生效**：流水线边搜边下，全局重排会打乱正在下的队列，所以「最热」不等于全网最热。
+
 ### 各平台对照
 
 | | 快手 | B站 | 抖音 |
@@ -331,7 +333,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（快手/B站/抖音）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞）、抖音 chunked 帧解码与错误分流、抖音行映射（缺字段保持 undefined，封面/音乐 URL 不当视频）、抖音文件名与游标抽取、抖音两套签名的路径规则（搜索族不签、作者作品双签、资料只签 `a_bogus`）与设备号绑定签名和参考实现的一致性，以及抗盗链 referer 归属、增量边界判定、`.part` 续传重试归因、任务级清晰度透传，与八个工具的注册与错误分支。当前 62 个用例。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（快手/B站/抖音）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞）、抖音 chunked 帧解码与错误分流、抖音行映射（缺字段保持 undefined，封面/音乐 URL 不当视频）、抖音文件名与游标抽取、抖音两套签名的路径规则（搜索族不签、作者作品双签、资料只签 `a_bogus`）与设备号绑定签名和参考实现的一致性，以及抗盗链 referer 归属、增量边界判定、`.part` 续传重试归因、任务级清晰度透传、页内排序口径，与八个工具的注册与错误分支。当前 63 个用例。
 
 ## 许可证
 

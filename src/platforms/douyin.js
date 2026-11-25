@@ -321,8 +321,8 @@ export async function openDouyinSession({ profileDir, log = () => {}, signal, po
       return { ok: true, text: String(out?.text || '') }
     }
 
-    /** 搜索一页。cursor 是 offset。 */
-    const searchOnce = async ({ keyword, cursor = '', sessionId: sid = '' }) => {
+    /** 搜索一页。cursor 是 offset；sortType 0 综合 / 1 最新 / 2 最多点赞（页面上的三个排序）。 */
+    const searchOnce = async ({ keyword, cursor = '', sessionId: sid = '', sortType = 0 }) => {
       const offset = Number(cursor) || 0
       const params = {
         device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web', pc_client_type: '1',
@@ -332,6 +332,7 @@ export async function openDouyinSession({ profileDir, log = () => {}, signal, po
         downlink: '10', effective_type: '4g', round_trip_time: '150',
         keyword, search_channel: 'aweme_general', search_source: 'normal_search',
         query_correct_type: '1', is_filter_search: '0', offset: String(offset), count: String(SEARCH_PAGE_SIZE),
+        sort_type: String(sortType || 0),
         list_type: 'single', search_id: sid, need_filter_settings: offset === 0 ? '1' : '0',
         enable_history: '1', disable_rs: '0', from_group_id: '', pc_libra_divert: 'Windows',
         pc_search_top_1_params: '{"enable_ai_search_top_1":1}', support_h265: '0', support_dash: '1',
@@ -476,7 +477,7 @@ function pageStateOfFrames(frames) {
  * 纯 HTTP 关键词搜索。
  * @returns {{verdict:object, rows:object[], cursor:string, hasMore:boolean, searchSessionId?:string, authorName?:string, transport?:string}}
  */
-export async function searchViaHttp(stateDir, { keyword, cursor = '', sessionId = '' } = {}) {
+export async function searchViaHttp(stateDir, { keyword, cursor = '', sessionId = '', sortType = 0 } = {}) {
   const cookie = loadCookieJar(stateDir)
   if (!cookie) return { verdict: { kind: 'need_login', message: '没有存盘的抖音 cookie' }, rows: [], cursor: '', hasMore: false }
   const http = createDouyinHttp({ cookie })
@@ -489,6 +490,7 @@ export async function searchViaHttp(stateDir, { keyword, cursor = '', sessionId 
     search_source: 'normal_search',
     query_correct_type: '1',
     is_filter_search: '0',
+    sort_type: String(sortType || 0),
   }
   if (sessionId) params.search_id = sessionId
   const r = await http.request(SEARCH_PATH, params, {
@@ -647,11 +649,12 @@ export function createDouyinAdapter() {
      * 这种行全部 `source.kind === 'missing'`，下不了、也筛不了点赞，等于没用。
      * 所以只有「能直接下」的行占比过半时才采用 HTTP 结果，否则回退浏览器通道。
      */
-    async searchKeyword(session, { keyword, cursor = '', sessionId = '' } = {}) {
+    async searchKeyword(session, { keyword, cursor = '', sessionId = '', sort = 'default' } = {}) {
+      const sortType = sort === 'latest' ? 1 : sort === 'most_liked' ? 2 : 0
       const stateDir = session?.stateDir
       if (stateDir) {
         try {
-          const viaHttp = await searchViaHttp(stateDir, { keyword, cursor, sessionId })
+          const viaHttp = await searchViaHttp(stateDir, { keyword, cursor, sessionId, sortType })
           const usable = viaHttp.rows.filter((r) => r?.source?.kind === 'direct').length
           if (viaHttp.verdict?.kind === 'ok' && usable * 2 >= viaHttp.rows.length && usable > 0) return viaHttp
           if (viaHttp.verdict?.kind === 'captcha' || viaHttp.verdict?.kind === 'rate_limited') {
@@ -662,7 +665,7 @@ export function createDouyinAdapter() {
           /* 落到浏览器通道 */
         }
       }
-      const r = await session.searchOnce({ keyword, cursor, sessionId })
+      const r = await session.searchOnce({ keyword, cursor, sessionId, sortType })
       return {
         verdict: r.verdict,
         rows: r.rows,

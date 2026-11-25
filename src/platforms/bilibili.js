@@ -247,14 +247,17 @@ export function createBilibiliAdapter({ resolveBilibili, downloadBilibili, quali
     /**
      * 关键词搜索。cursor 是页码（从 1 开始）。
      */
-    async searchKeyword(_session, { keyword, cursor = 1, signal, order = 'totalrank' }) {
+    async searchKeyword(_session, { keyword, cursor = 1, signal, order = 'totalrank', sort = 'default' }) {
       const page = Math.max(1, Number(cursor) || 1)
+      // 接口只认 totalrank（综合）/ click（播放）/ pubdate（最新）/ dm（弹幕）/ stow（收藏），没有点赞排序。
+      // sort 是跨平台的统一口径：latest 映射到接口的 pubdate，most_liked 保持综合再由调度层页内按点赞降序。
+      const useOrder = sort === 'latest' ? 'pubdate' : order || 'totalrank'
       const params = {
         search_type: 'video',
         keyword,
         page,
         page_size: 20,
-        order: order || 'totalrank',
+        order: useOrder,
         platform: 'pc',
       }
       const res = await signedGet(SEARCH_URL, params, { referer: 'https://search.bilibili.com/', signal })

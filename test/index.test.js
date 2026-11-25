@@ -48,6 +48,7 @@ import {
   reachedCrawlBoundary,
   refererFor,
   safeDirName,
+  sortCrawlRows,
   summarizeTimings,
 } from '../src/crawl.js'
 import {
@@ -960,5 +961,19 @@ test('reachedCrawlBoundary trips only after N consecutive all-seen pages', () =>
   // 自定义窗口，且非法值回落 3
   assert.equal(reachedCrawlBoundary({ stalePages: 1, staleLimit: 1 }), true)
   assert.equal(reachedCrawlBoundary({ stalePages: 2, staleLimit: 0 }), false)
+})
+
+test('sortCrawlRows orders by time or likes and keeps the source array intact', () => {
+  const rows = [
+    { id: 'a', timestampMs: 100, likeCount: 5 },
+    { id: 'b', timestampMs: 300, likeCount: undefined },
+    { id: 'c', timestampMs: 200, likeCount: 50 },
+  ]
+  assert.deepEqual(sortCrawlRows(rows, 'default').map((r) => r.id), ['a', 'b', 'c'])
+  assert.deepEqual(sortCrawlRows(rows, 'latest').map((r) => r.id), ['b', 'c', 'a'])
+  // 缺点赞的行排最后，不补 0
+  assert.deepEqual(sortCrawlRows(rows, 'most_liked').map((r) => r.id), ['c', 'a', 'b'])
+  assert.deepEqual(rows.map((r) => r.id), ['a', 'b', 'c'])
+  assert.deepEqual(sortCrawlRows(null, 'latest'), [])
 })
 

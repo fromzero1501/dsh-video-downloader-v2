@@ -3056,6 +3056,7 @@ export function apply(ctx, config) {
       concurrency: { type: 'number', description: '可选：同时下载几条，默认 6、上限 8。实测 6 并发聚合吞吐最高。' },
       quality: { type: 'string', description: '可选：清晰度（best / worst / 112 / 80 / 64 / 32 / 16）。只对能从多个清晰度里挑的平台生效（B站），直链平台忽略。' },
       incremental: { type: 'boolean', description: '可选：增量边界，默认开。连续几页都是已下过的作品就停止翻页，重复跑同一作者时能省掉大量请求。' },
+      sort: { type: 'string', description: '可选：结果排序 default（接口原序）/ latest（最新）/ most_liked（最多点赞）。抖音与 B站 会带接口参数，快手只在页内排。' },
     },
     output: OUTPUT,
     async execute(args) {
@@ -3081,6 +3082,7 @@ export function apply(ctx, config) {
           concurrency: args.concurrency,
           quality: args.quality,
           incremental: args.incremental,
+          sort: args.sort,
           filters,
         })
         return JSON.stringify({
@@ -3094,6 +3096,7 @@ export function apply(ctx, config) {
           dir: job.dir,
           status: job.status,
           limit: job.limit,
+          sort: job.sort,
           filters: job.filters,
           filterNotes: job.filterNotes,
           indexPath: crawler.indexPath,

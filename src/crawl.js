@@ -136,6 +136,23 @@ export function reachedCrawlBoundary({ stalePages = 0, staleLimit = 3, increment
 }
 
 /**
+ * 搜索结果的统一排序口径（页内生效）：default 保持接口原序；latest 按发布时间降序；
+ * most_liked 按点赞降序。缺字段的行排到后面，不补 0——「0 赞」和「接口没给」是两件事。
+ */
+export function sortCrawlRows(rows = [], sort = 'default') {
+  const list = Array.isArray(rows) ? rows.slice() : []
+  if (sort !== 'latest' && sort !== 'most_liked') return list
+  const score = (row) => {
+    const v = Number(sort === 'latest' ? row?.timestampMs : row?.likeCount)
+    return Number.isFinite(v) && v > 0 ? v : -1
+  }
+  return list
+    .map((row, i) => ({ row, i }))
+    .sort((a, b) => score(b.row) - score(a.row) || a.i - b.i)
+    .map((x) => x.row)
+}
+
+/**
  * 把原始计时压成能直接看懂的摘要：页均/条均/最慢几条/单条平均速率。
  * 注意两件事：①下载是并发的，items 的 ms 之和会大于 downloadMs；
  * ②搜索和下载现在是流水线并行，searchMs 与 downloadMs 有重叠，两者相加大于墙钟。
@@ -554,6 +571,7 @@ export function createCrawler({
       const before = job.found.length
       job.stats.searched += rows.length
       let unseen = 0
+      const keep = []
       for (const row of rows) {
         // 「新」按索引判断，不受筛选影响：筛选挡掉的也算翻到了新内容，否则会被误判到底。
         const isNew = !known(row.id)
@@ -562,9 +580,11 @@ export function createCrawler({
         seenLocal.add(row.id)
         if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
         if (!adapter.canDownload(row)) { job.stats.noSource += 1; continue }
-        job.found.push({ ...row, keyword: label })
+        keep.push(row)
         if (isNew) fresh += 1
       }
+      // 页内再排一次：平台接口的排序能力不齐（快手搜索没有排序参数），统一口径只能在这里落。
+      for (const row of sortCrawlRows(keep, job.sort)) job.found.push({ ...row, keyword: label })
       job.stats.found = job.found.length
       return { rows: rows.length, kept: job.found.length - before, unseen }
     }
@@ -615,7 +635,7 @@ export function createCrawler({
         job.phase = { word: label, page: pages + 1 }
         persist(job)
         const pageStartedAt = Date.now()
-        const res = await adapter.listCreator(session, { creatorId: job.creatorId, cursor: pcursor, signal })
+        const res = await adapter.listCreator(session, { creatorId: job.creatorId, cursor: pcursor, signal, sort: job.sort })
         if (await handleVerdict(res.verdict) === 'retry') continue
         const counted = absorb(res.rows, label)
         if (!job.creatorName && res.authorName) job.creatorName = res.authorName
@@ -661,7 +681,7 @@ export function createCrawler({
         // 每个环节都单独计时：这次的目标不是"能跑"，是"知道时间花在哪"。
         const pageStartedAt = Date.now()
 
-        const res = await adapter.searchKeyword(session, { keyword: word, cursor: pcursor, sessionId, signal })
+        const res = await adapter.searchKeyword(session, { keyword: word, cursor: pcursor, sessionId, signal, sort: job.sort })
         if (await handleVerdict(res.verdict) === 'retry') continue
         const counted = absorb(res.rows, word)
         persist(job)
@@ -961,6 +981,7 @@ export function createCrawler({
         filterNotes,
         incremental: opts.incremental !== false,
         quality: opts.quality ? String(opts.quality) : '',
+        sort: ['latest', 'most_liked'].includes(String(opts.sort || '')) ? String(opts.sort) : 'default',
         status: 'queued',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -990,6 +1011,7 @@ export function createCrawler({
         creatorName: job.creatorName || '',
         filterNotes: job.filterNotes || [],
         boundaryHit: job.boundaryHit || '',
+        sort: job.sort || 'default',
         status: job.status,
         dir: job.dir,
         limit: job.limit,
