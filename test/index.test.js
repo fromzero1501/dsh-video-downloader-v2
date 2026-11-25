@@ -41,6 +41,7 @@ import {
   passesCrawlFilter,
   platformLabel,
   safeDirName,
+  summarizeTimings,
 } from '../src/crawl.js'
 import {
   kuaishouFeeds,
@@ -550,4 +551,38 @@ test('crawl index remembers hits but misses when the file is gone', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('summarizeTimings reports page/item averages, slowest and throughput', () => {
+  const empty = summarizeTimings()
+  assert.equal(empty.searchMs, 0)
+  assert.equal(empty.pages.count, 0)
+  assert.equal(empty.items.avgMs, 0)
+  assert.deepEqual(empty.items.slowest, [])
+
+  const s = summarizeTimings({
+    searchMs: 9000,
+    downloadMs: 30000,
+    pages: [{ ms: 2000 }, { ms: 4000 }],
+    items: [
+      { id: 'a', ms: 1000, bytes: 1000, ok: true },
+      { id: 'b', ms: 3000, bytes: 9000, ok: true },
+      { id: 'c', ms: 500, bytes: 0, ok: false },
+      { id: 'd', ms: 2000, bytes: 4000, ok: true },
+    ],
+  })
+  assert.equal(s.searchMs, 9000)
+  assert.equal(s.downloadMs, 30000)
+  assert.equal(s.pages.count, 2)
+  assert.equal(s.pages.avgMs, 3000)
+  assert.equal(s.pages.maxMs, 4000)
+  assert.equal(s.items.count, 4)
+  assert.equal(s.items.ok, 3)
+  assert.equal(s.items.failed, 1)
+  // 平均值只算成功的（失败那条的 500ms 不能拉低平均）
+  assert.equal(s.items.avgMs, 2000)
+  assert.equal(s.items.maxMs, 3000)
+  assert.deepEqual(s.items.slowest.map((x) => x.id), ['b', 'd', 'a'])
+  // 14000 字节 / 6000ms
+  assert.equal(s.items.bytesPerSec, 2333)
 })

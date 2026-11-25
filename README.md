@@ -13,7 +13,7 @@ DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链�
 | `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；抖音用本地浏览器取播放流直下；其他站点页面链接交给通用后端（yt-dlp → lux） |
 | `video_quality_parse` | 从 URL 参数推断画质与容器格式，纯本地计算 |
 | `video_crawl` | 按关键词批量爬取快手视频（异步任务，立刻返回 `jobId`）：落盘到 `<根>\快手\<关键词>\`，下载前按「最近 N 天发布 / 最低点赞 / 最低播放量」筛选，索引去重，重复跑是增量 |
-| `video_crawl_status` | 查爬取进度：`phase`（当前关键词 + 第几页）、`stats`（搜到/筛掉/已下/跳过/失败/字节）、`items`、`needHuman`（暂停原因 + 二维码截图路径） |
+| `video_crawl_status` | 查爬取进度：`phase`（当前关键词 + 第几页）、`stats`（搜到/筛掉/已下/跳过/失败/字节）、`items`、`timings`（搜索/下载墙钟、页均、单条均、吞吐、最慢三条）、`needHuman`（暂停原因 + 二维码截图路径） |
 | `video_crawl_resume` | 人工处理完验证码 / 扫码后，从索引里已下载的条目之后继续跑 |
 | `video_crawl_cancel` | 取消任务（已下载的文件保留） |
 
@@ -119,6 +119,8 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 **遇到验证码 / 风控**：立刻**暂停任务**（`status: paused_need_human`），把当时的页面截图存到 `<DSH_HOME>\video-downloader\kuaishou\pause-<jobId>.png`，在 `needHuman` 里带上是登录失效、验证码还是被拦。你人工处理完用 `video_crawl_resume` 续跑，从已下载的条目之后继续。
 
+**各环节用时**：任务的 `timings` 字段记录搜索阶段与下载阶段的墙钟耗时，并给出页均/单条均/最慢三条/下载吞吐（`bytesPerSec`）。下载是并发跑的，所以所有单条耗时加起来会大于下载墙钟，别拿两者相减。`video_crawl_status` 直接回 `timings` 的汇总值，用来判断该调页间隔还是该调并发。
+
 **已知限制**：安全 cookie（`kwscode` / `kwssectoken`）大约 6 分钟轮换一次，所以登录态是靠持久 profile 里的浏览器会话维持的，不是靠抓一段 cookie 复制走；快手改签名算法就得跟着改（劫持点只有一个，改起来集中）。任务只在 DSH 进程活着时跑，进程重启后未完成的任务要手动 `video_crawl_resume`。
 
 ## 抖音通路
@@ -221,7 +223,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重，以及八个工具的注册与错误分支。当前 41 个用例。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、各环节耗时汇总（`summarizeTimings`），以及八个工具的注册与错误分支。当前 42 个用例。
 
 ## 许可证
 

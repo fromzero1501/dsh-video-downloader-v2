@@ -115,6 +115,38 @@ export function normalizeCrawlFilters(raw = {}) {
   return { minLike: num(raw.minLike), minView: num(raw.minView), maxAgeDays: num(raw.maxAgeDays) }
 }
 
+/**
+ * 把原始计时压成能直接看懂的摘要：页均/条均/最慢几条/单条平均速率。
+ * 注意下载是并发的，items 的 ms 之和会大于 downloadMs，别把它当墙钟时间。
+ */
+export function summarizeTimings(timings = {}) {
+  const pages = Array.isArray(timings.pages) ? timings.pages : []
+  const items = Array.isArray(timings.items) ? timings.items : []
+  const ok = items.filter((x) => x.ok !== false)
+  const avg = (arr) => (arr.length ? Math.round(arr.reduce((s, x) => s + (x.ms || 0), 0) / arr.length) : 0)
+  const max = (arr) => arr.reduce((m, x) => Math.max(m, x.ms || 0), 0)
+  const bytes = ok.reduce((s, x) => s + (x.bytes || 0), 0)
+  const itemMs = ok.reduce((s, x) => s + (x.ms || 0), 0)
+  return {
+    searchMs: timings.searchMs || 0,
+    downloadMs: timings.downloadMs || 0,
+    pages: { count: pages.length, avgMs: avg(pages), maxMs: max(pages) },
+    items: {
+      count: items.length,
+      ok: ok.length,
+      failed: items.length - ok.length,
+      avgMs: avg(ok),
+      maxMs: max(ok),
+      bytesPerSec: itemMs > 0 ? Math.round((bytes / itemMs) * 1000) : 0,
+      slowest: ok
+        .slice()
+        .sort((a, b) => (b.ms || 0) - (a.ms || 0))
+        .slice(0, 3)
+        .map((x) => ({ id: x.id, ms: x.ms, bytes: x.bytes })),
+    },
+  }
+}
+
 /** 下载一条直链到文件，失败时按 backupUrl 逐个重试。 */
 async function downloadDirect(url, file, { signal, backupUrls = [] } = {}) {
   const headers = { 'user-agent': UA, referer: 'https://www.kuaishou.com/', accept: '*/*' }
@@ -201,7 +233,17 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
       .map((n) => readJob(n.replace(/\.json$/, '')))
       .filter(Boolean)
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-    return rows.slice(0, limit)
+    // 列表页只要概要：timings / found 这类大字段不进列表，否则状态文件一多就拖死。
+    return rows.slice(0, limit).map((job) => ({
+      id: job.id,
+      keyword: job.keyword,
+      status: job.status,
+      dir: job.dir,
+      limit: job.limit,
+      stats: job.stats,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    }))
   }
 
   function newJobId() {
@@ -235,6 +277,9 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
         job.phase = { word, wordIndex: wi, wordCount: words.length, page: pages + 1 }
         persist(job)
+        // 每个环节都单独计时：这次的目标不是"能跑"，是"知道时间花在哪"。
+        const pageStartedAt = Date.now()
+        const foundBefore = job.found.length
 
         const payload = await session.searchOnce({ keyword: word, pcursor, searchSessionId: sessionId })
         if (payload?.__transport) {
@@ -264,6 +309,14 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         }
         job.stats.found = job.found.length
         persist(job)
+        job.timings.pages.push({
+          word,
+          page: pages + 1,
+          ms: Date.now() - pageStartedAt,
+          rows: rows.length,
+          kept: job.found.length - foundBefore,
+          dropped: rows.length - (job.found.length - foundBefore),
+        })
         log(`「${word}」第 ${pages + 1} 页拿到 ${rows.length} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
 
         if (job.found.length >= job.limit) return true
@@ -301,6 +354,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
         const row = targets[cursor++]
         const file = join(job.dir, kuaishouFileName(row.caption, row.id))
+        const itemStartedAt = Date.now()
         try {
           mkdirSync(job.dir, { recursive: true })
           const bytes = await downloadDirect(row.source.url, file, { signal, backupUrls: row.source.backupUrl })
@@ -319,10 +373,12 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
             log(`索引写入失败：${err?.message || err}`)
           }
           log(`已下载 ${row.id} → ${bytes} 字节`)
+          job.timings.items.push({ id: row.id, ms: Date.now() - itemStartedAt, bytes, ok: true })
         } catch (err) {
           row.status = 'failed'
           row.error = String(err?.message || err)
           job.stats.failed += 1
+          job.timings.items.push({ id: row.id, ms: Date.now() - itemStartedAt, bytes: 0, ok: false })
           log(`下载失败 ${row.id}：${row.error}`)
         }
         persist(job)
@@ -364,10 +420,14 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         log('登录态已就绪，继续爬取')
       }
 
+      const searchStartedAt = Date.now()
       await searchPhase(job, session, signal)
+      job.timings.searchMs = Date.now() - searchStartedAt
       job.phase = { ...(job.phase || {}), page: 0 }
       setStatus(job, 'downloading')
+      const downloadStartedAt = Date.now()
       await downloadPhase(job, signal)
+      job.timings.downloadMs = Date.now() - downloadStartedAt
 
       const done = job.stats.downloaded
       const total = job.stats.found
@@ -421,6 +481,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         updatedAt: new Date().toISOString(),
         phase: {},
         stats: { searched: 0, found: 0, filtered: 0, noSource: 0, downloaded: 0, skipped: 0, failed: 0, bytes: 0 },
+        timings: { searchMs: 0, downloadMs: 0, pages: [], items: [] },
         found: [],
         needHuman: null,
         error: '',
@@ -445,6 +506,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         filters: job.filters,
         phase: job.phase,
         stats: job.stats,
+        timings: summarizeTimings(job.timings),
         needHuman: job.needHuman,
         error: job.error,
         createdAt: job.createdAt,
