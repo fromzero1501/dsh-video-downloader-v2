@@ -37,9 +37,12 @@ import {
 import {
   indexHit,
   absolutizePlaylist,
+  DOWNLOAD_STALL_MS,
+  isRetryableDownloadError,
   loadCrawlIndex,
   normalizeCrawlFilters,
   passesCrawlFilter,
+  pickDownloadTask,
   platformLabel,
   safeDirName,
   summarizeTimings,
@@ -636,4 +639,35 @@ test('summarizeTimings reports page/item averages, slowest and throughput', () =
   assert.deepEqual(s.items.slowest.map((x) => x.id), ['b', 'd', 'a'])
   // 14000 字节 / 6000ms
   assert.equal(s.items.bytesPerSec, 2333)
+})
+
+test('pickDownloadTask waits for the search phase instead of quitting early', () => {
+  // 搜索还没结束、暂时没货：等，不要收工
+  assert.deepEqual(pickDownloadTask({ cursor: 0, foundLength: 0, limit: 10, searchDone: false }), { action: 'wait' })
+  // 有货就取当前这条
+  assert.deepEqual(pickDownloadTask({ cursor: 2, foundLength: 5, limit: 10, searchDone: false }), { action: 'take', index: 2 })
+  // 已到 limit：即使搜索还在跑也算下够
+  assert.deepEqual(pickDownloadTask({ cursor: 10, foundLength: 30, limit: 10, searchDone: false }), { action: 'stop' })
+  // 搜索结束且已消费完：收工
+  assert.deepEqual(pickDownloadTask({ cursor: 3, foundLength: 3, limit: 10, searchDone: true }), { action: 'stop' })
+  // 搜索结束但一条都没搜到
+  assert.deepEqual(pickDownloadTask({ cursor: 0, foundLength: 0, limit: 10, searchDone: true }), { action: 'stop' })
+  // limit=0 表示「额度由调用方另算」，这里只负责按 found 取/等/停
+  assert.deepEqual(pickDownloadTask({ cursor: 5, foundLength: 30, limit: 0, searchDone: false }), { action: 'take', index: 5 })
+  assert.deepEqual(pickDownloadTask({ cursor: 30, foundLength: 30, limit: 0, searchDone: false }), { action: 'wait' })
+  assert.deepEqual(pickDownloadTask({ cursor: 30, foundLength: 30, limit: 0, searchDone: true }), { action: 'stop' })
+})
+
+test('download watchdog treats stalls and truncation as retryable, 4xx as not', () => {
+  assert.equal(DOWNLOAD_STALL_MS, 15000)
+  // 卡住不动、响应被截断、5xx、连接断：值得重连
+  assert.equal(isRetryableDownloadError('15 秒没有任何数据，断开重连'), true)
+  assert.equal(isRetryableDownloadError('只下到 15130/78490665 字节，响应被截断'), true)
+  assert.equal(isRetryableDownloadError('单条超过 300 秒，放弃'), true)
+  assert.equal(isRetryableDownloadError('HTTP 503 Service Unavailable'), true)
+  assert.equal(isRetryableDownloadError('fetch failed'), true)
+  // 客户端错误重连也没用
+  assert.equal(isRetryableDownloadError('HTTP 403 Forbidden'), false)
+  assert.equal(isRetryableDownloadError('HTTP 404 Not Found'), false)
+  assert.equal(isRetryableDownloadError(''), false)
 })

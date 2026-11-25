@@ -2779,6 +2779,7 @@ export function apply(ctx, config) {
       '搜索策略：先把同一个关键词翻页到底，条数还不够再用 synonyms 里的同义词逐个搜（同义词由调用方生成）。' +
       '去重键是「平台+videoid」，索引里已有且文件还在盘的跳过，所以重复跑是增量。' +
       '遇到限流会退避重试；遇到验证码/风控会暂停任务并在 needHuman 里给出截图路径，等你人工处理后用 video_crawl_resume 续跑。' +
+      '搜索（快手 API）与下载（CDN）并行进行，下载并发默认 6，所以 status 里的 searchMs 与 downloadMs 会重叠，两者相加大于总耗时为正常。' +
       '返回 { ok, jobId, dir, status, limit, filters, indexPath }。',
     parameters: {
       keyword: { type: 'string', required: true, description: '搜索关键词，同时作为落盘子目录名。' },
@@ -2789,6 +2790,7 @@ export function apply(ctx, config) {
       minLike: { type: 'number', description: '可选：最低点赞（=喜欢）数，覆盖设置页默认值。' },
       minView: { type: 'number', description: '可选：最低播放量，覆盖设置页默认值。' },
       maxAgeDays: { type: 'number', description: '可选：只要最近 N 天内发布的，覆盖设置页默认值。' },
+      concurrency: { type: 'number', description: '可选：同时下载几条，默认 6、上限 8。实测 6 并发聚合吞吐最高。' },
     },
     output: OUTPUT,
     async execute(args) {
@@ -2804,6 +2806,7 @@ export function apply(ctx, config) {
           maxPages: args.maxPages,
           synonyms: args.synonyms,
           root: args.root,
+          concurrency: args.concurrency,
           filters,
         })
         return JSON.stringify({

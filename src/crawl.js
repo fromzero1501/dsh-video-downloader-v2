@@ -10,6 +10,13 @@
  *   - 先同词翻页到底；不够条数再用同义词逐个搜（同义词由 agent 生成后传进来）。
  *   - 遇限流退避重试；遇验证码/风控立刻暂停并留证据，等人工处理后 resume。
  *   - 已在索引里且文件还在盘的条目跳过（可重复跑，增量）。
+ *
+ * 性能取舍（2026-11-25 实测，见 README「耗时与并发」）：
+ *   - 搜索和下载走两条不同通道（API vs CDN），**并行跑**：搜到前几条就让下载协程开工，
+ *     总时长从「搜索 + 下载」变成「max(搜索, 下载)」。
+ *   - 下载并发默认 6：实测聚合吞吐 2→6.2MB/s、4→19.8、6→36.7、8→30.7，拐点在 6。
+ *   - 不做 Range 分段：同一批文件分段实测总时长反而比单流长 69%（小文件分段更差），
+ *     长尾改用「单条超时重连」，理由与数据都在 README。
  */
 
 import {
@@ -121,7 +128,8 @@ export function normalizeCrawlFilters(raw = {}) {
 
 /**
  * 把原始计时压成能直接看懂的摘要：页均/条均/最慢几条/单条平均速率。
- * 注意下载是并发的，items 的 ms 之和会大于 downloadMs，别把它当墙钟时间。
+ * 注意两件事：①下载是并发的，items 的 ms 之和会大于 downloadMs；
+ * ②搜索和下载现在是流水线并行，searchMs 与 downloadMs 有重叠，两者相加大于墙钟。
  */
 export function summarizeTimings(timings = {}) {
   const pages = Array.isArray(timings.pages) ? timings.pages : []
@@ -132,6 +140,7 @@ export function summarizeTimings(timings = {}) {
   const bytes = ok.reduce((s, x) => s + (x.bytes || 0), 0)
   const itemMs = ok.reduce((s, x) => s + (x.ms || 0), 0)
   return {
+    pipeline: true,
     searchMs: timings.searchMs || 0,
     downloadMs: timings.downloadMs || 0,
     pages: { count: pages.length, avgMs: avg(pages), maxMs: max(pages) },
@@ -153,6 +162,37 @@ export function summarizeTimings(timings = {}) {
 
 /** 快手有时候只给 HLS 播放列表，直接存下来是一段文本而不是视频。 */
 const HLS_MAGIC = '#EXTM3U'
+
+/**
+ * 流水线取条：搜索还没结束时，下载协程可能暂时没活干，不能直接收工。
+ * 返回 { action: 'take', index } | { action: 'wait' } | { action: 'stop' }。纯函数。
+ */
+export function pickDownloadTask({ cursor = 0, foundLength = 0, limit = 0, searchDone = true } = {}) {
+  const found = Math.max(0, Number(foundLength) || 0)
+  const explicit = Number(limit) > 0
+  const want = explicit ? Number(limit) : Infinity
+  const at = Math.max(0, Number(cursor) || 0)
+  // 明确给了 limit 且已认领够数：搜索还在跑也不等了，直接收工。
+  if (explicit && at >= want) return { action: 'stop' }
+  if (at < Math.min(want, found)) return { action: 'take', index: at }
+  return searchDone ? { action: 'stop' } : { action: 'wait' }
+}
+
+/** 这条下载错误值不值得重连一次（卡死/截断/服务端 5xx/连接断，值得；4xx 不值得）。 */
+export function isRetryableDownloadError(message) {
+  const text = String(message || '')
+  if (/HTTP 4\d\d/.test(text)) return false
+  return /没有任何数据|响应被截断|单条超过|HTTP 5\d\d|fetch failed|socket|ECONNRESET|ETIMEDOUT|aborted/i.test(text)
+}
+
+/** 单条连接「停滞」多久算卡死：连续这么久没有任何字节进来就断开重连。
+ * 注意这不是按体积算的硬超时——实测快手 CDN 上 78MB 用 75 秒（约 1MB/s）也能正常下完，
+ * 硬超时会误杀这种「慢但在推进」的连接；真正该杀的是长时间一个字都不来的。
+ */
+export const DOWNLOAD_STALL_MS = 15000
+
+/** 单条总预算：极慢但一直有数据的连接也不能无限挂着。 */
+export const DOWNLOAD_TOTAL_MS = 300000
 
 /** 读文件头几个字节（用来判断落盘的到底是视频还是播放列表）。 */
 function readHead(file, bytes = 256) {
@@ -233,23 +273,50 @@ async function mergeHlsToMp4(playlistFile, mp4File, sourceUrl, { signal, ffmpeg 
   }
 }
 
-/** 下载一条直链到文件，失败时按 backupUrl 逐个重试；落盘是播放列表就合并成 mp4。 */
-async function downloadDirect(url, file, { signal, backupUrls = [], ffmpeg } = {}) {
+/**
+ * 下载一条直链到文件，失败时按 backupUrl 逐个重试；落盘是播放列表就合并成 mp4。
+ * stallMs：连续多久没数据算卡死（断开重连）；totalMs：单条总预算。
+ */
+async function downloadDirect(url, file, {
+  signal, backupUrls = [], ffmpeg, stallMs = DOWNLOAD_STALL_MS, totalMs = DOWNLOAD_TOTAL_MS,
+} = {}) {
   const headers = { 'user-agent': UA, referer: 'https://www.kuaishou.com/', accept: '*/*' }
   const once = async (target) => {
-    const res = await fetch(target, { headers, signal, redirect: 'follow' })
-    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`)
-    const ws = createWriteStream(file)
-    let bytes = 0
-    const src = Readable.fromWeb(res.body)
-    src.on('data', (chunk) => { bytes += chunk.length })
-    await new Promise((res2, rej) => {
-      src.on('error', rej)
-      ws.on('error', rej)
-      ws.on('finish', res2)
-      src.pipe(ws)
-    })
-    return bytes
+    const ctrl = new AbortController()
+    let last = Date.now()
+    const onAbort = () => ctrl.abort(signal?.reason)
+    if (signal) {
+      if (signal.aborted) ctrl.abort(signal.reason)
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
+    const watchdog = setInterval(() => {
+      if (Date.now() - last > stallMs) ctrl.abort(new Error(`${Math.round(stallMs / 1000)} 秒没有任何数据，断开重连`))
+    }, 2000)
+    const deadline = totalMs > 0
+      ? setTimeout(() => ctrl.abort(new Error(`单条超过 ${Math.round(totalMs / 1000)} 秒，放弃`)), totalMs)
+      : null
+    try {
+      const res = await fetch(target, { headers, signal: ctrl.signal, redirect: 'follow' })
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+      const expect = Number(res.headers.get('content-length') || 0)
+      const ws = createWriteStream(file)
+      let bytes = 0
+      const src = Readable.fromWeb(res.body)
+      src.on('data', (chunk) => { bytes += chunk.length; last = Date.now() })
+      await new Promise((res2, rej) => {
+        src.on('error', rej)
+        ws.on('error', rej)
+        ws.on('finish', res2)
+        src.pipe(ws)
+      })
+      // 响应被掐断时流会「正常」结束：只拿到一小截不能当成功（实测见过 15KB 就 finish）。
+      if (expect > 0 && bytes < expect) throw new Error(`只下到 ${bytes}/${expect} 字节，响应被截断`)
+      return bytes
+    } finally {
+      clearInterval(watchdog)
+      if (deadline) clearTimeout(deadline)
+      if (signal) signal.removeEventListener('abort', onAbort)
+    }
   }
   const candidates = [url, ...backupUrls.filter((u) => u && u !== url)]
   let lastErr = null
@@ -352,10 +419,16 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
     return persist(job)
   }
 
-  /** 搜索阶段：同词翻页，把结果塞进 job.found。返回是否已够数。 */
-  async function searchPhase(job, session, signal) {
+  /**
+   * 搜索阶段：同词翻页，把结果塞进 job.found。返回是否已够数。
+   * 够不够数按「索引里还没有的」算：重复跑同一个词时，已下过的不占额度，
+   * 否则它会以为搜够了，实际只补到一两条（索引命中在下载阶段还会再确认文件在不在盘）。
+   */
+  async function searchPhase(job, session, signal, index) {
     const words = [job.keyword, ...(job.synonyms || [])].filter(Boolean)
     const seenLocal = new Set(job.found.map((x) => x.id))
+    const known = (id) => Boolean(index && index.has(`${platform}:${id}`))
+    let fresh = job.found.filter((r) => !known(r.id)).length
     let rateHits = 0
 
     for (let wi = 0; wi < words.length; wi++) {
@@ -398,6 +471,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
           if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
           if (!row.source) { job.stats.noSource += 1; continue }
           job.found.push({ ...row, keyword: word })
+          if (!known(row.id)) fresh += 1
         }
         job.stats.found = job.found.length
         persist(job)
@@ -411,7 +485,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         })
         log(`「${word}」第 ${pages + 1} 页拿到 ${rows.length} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
 
-        if (job.found.length >= job.limit) return true
+        if (fresh >= job.limit) return true
         const next = typeof payload?.pcursor === 'string' ? payload.pcursor : ''
         sessionId = typeof payload?.searchSessionId === 'string' ? payload.searchSessionId : sessionId
         if (!next || visited.has(next)) break
@@ -422,34 +496,54 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         await sleep(minDelay + Math.floor(Math.random() * 1500))
       }
     }
-    return job.found.length >= job.limit
+    return fresh >= job.limit
   }
 
-  /** 下载阶段：并发 2，逐条落盘 + 写索引。 */
-  async function downloadPhase(job, signal) {
+  /**
+   * 下载阶段：并发消费 job.found，逐条落盘 + 写索引。
+   * 流水线：搜索还在往里追加时，这里边等边下；搜索收工且已下完就退出。
+   */
+  async function downloadPhase(job, signal, ctx = {}) {
+    const searchDone = typeof ctx.searchDone === 'function' ? ctx.searchDone : () => true
     const index = loadCrawlIndex(indexFile)
-    const queue = job.found.slice(0, job.limit)
-    const targets = []
-    for (const row of queue) {
-      if (indexHit(index, platform, row.id)) {
-        job.stats.skipped += 1
-        row.status = 'skipped'
-        continue
-      }
-      targets.push(row)
-    }
-    persist(job)
-
+    const concurrency = Math.max(1, Math.min(8, Number(job.concurrency) || 6))
     let cursor = 0
+    let attempted = 0
+    let retried = 0
+
     const worker = async () => {
-      while (cursor < targets.length) {
+      for (;;) {
         if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
-        const row = targets[cursor++]
+        // 额度按下「真正尝试下载的条数」算：索引里已下过的跳过不占额度，
+        // 否则重复跑一个词时会因为大半被跳过而只补到一两条。
+        if (attempted >= job.limit) return
+        const pick = pickDownloadTask({
+          cursor,
+          foundLength: job.found.length,
+          limit: 0,
+          searchDone: searchDone(),
+        })
+        if (pick.action === 'stop') return
+        if (pick.action === 'wait') { await sleep(300); continue }
+        cursor = pick.index + 1
+        const row = job.found[pick.index]
+        if (!row) { await sleep(200); continue }
+
+        if (indexHit(index, platform, row.id)) {
+          job.stats.skipped += 1
+          row.status = 'skipped'
+          persist(job)
+          continue
+        }
+        attempted += 1
+
         const file = join(job.dir, kuaishouFileName(row.caption, row.id))
         const itemStartedAt = Date.now()
         try {
           mkdirSync(job.dir, { recursive: true })
-          const bytes = await downloadDirect(row.source.url, file, { signal, backupUrls: row.source.backupUrl, ffmpeg })
+          const bytes = await downloadDirect(row.source.url, file, {
+            signal, backupUrls: row.source.backupUrl, ffmpeg,
+          })
           row.status = 'done'
           row.file = file
           row.bytes = bytes
@@ -467,6 +561,16 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
           log(`已下载 ${row.id} → ${bytes} 字节`)
           job.timings.items.push({ id: row.id, ms: Date.now() - itemStartedAt, bytes, ok: true })
         } catch (err) {
+          if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
+          // 卡死/截断：回队列重连一次，别让一条烂连接把整批拖住。
+          if (isRetryableDownloadError(err?.message) && retried < Math.max(3, concurrency)) {
+            retried += 1
+            cursor -= 1
+            job.timings.items.push({ id: row.id, ms: Date.now() - itemStartedAt, bytes: 0, ok: false, retry: true })
+            log(`下载重连 ${row.id}（第 ${retried} 次）：${err?.message || err}`)
+            await sleep(500)
+            continue
+          }
           row.status = 'failed'
           row.error = String(err?.message || err)
           job.stats.failed += 1
@@ -477,7 +581,6 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
       }
     }
 
-    const concurrency = Math.max(1, Math.min(4, job.concurrency || 2))
     await Promise.all(Array.from({ length: concurrency }, worker))
     return job.stats.downloaded
   }
@@ -512,19 +615,48 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         log('登录态已就绪，继续爬取')
       }
 
+      // 搜索与下载并行：搜索打 API、下载打 CDN，本来就是两条通道，串着跑等于白等。
+      // 搜索一旦出问题（验证码/限流），下载会先把已搜到的条目下完再收工，不浪费。
       const searchStartedAt = Date.now()
-      await searchPhase(job, session, signal)
-      job.timings.searchMs = Date.now() - searchStartedAt
+      let searchDone = false
+      let searchErr = null
+      const indexSnapshot = loadCrawlIndex(indexFile)
+      const searchTask = (async () => {
+        try {
+          await searchPhase(job, session, signal, indexSnapshot)
+        } catch (err) {
+          searchErr = err
+        } finally {
+          searchDone = true
+          job.timings.searchMs = Date.now() - searchStartedAt
+        }
+      })()
+
+      const warmup = Math.min(4, job.limit)
+      while (!searchDone && job.found.length < warmup && !signal.aborted) await sleep(200)
+
       job.phase = { ...(job.phase || {}), page: 0 }
-      setStatus(job, 'downloading')
+      setStatus(job, 'downloading', { searchRunning: !searchDone })
       const downloadStartedAt = Date.now()
-      await downloadPhase(job, signal)
-      job.timings.downloadMs = Date.now() - downloadStartedAt
+      let downloadErr = null
+      try {
+        await downloadPhase(job, signal, { searchDone: () => searchDone })
+      } catch (err) {
+        downloadErr = err
+      } finally {
+        job.timings.downloadMs = Date.now() - downloadStartedAt
+      }
+      await searchTask
+
+      if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
+      if (searchErr) throw searchErr
+      if (downloadErr) throw downloadErr
 
       const done = job.stats.downloaded
       const total = job.stats.found
       setStatus(job, done > 0 ? (done >= Math.min(total, job.limit) ? 'done' : 'partial') : 'partial', {
         finishedAt: new Date().toISOString(),
+        searchRunning: false,
       })
     } catch (err) {
       if (err instanceof PauseSignal) {
@@ -566,7 +698,7 @@ export function createCrawler({ stateDir, defaultRoot, platform = 'kuaishou', de
         dir,
         limit,
         maxPages,
-        concurrency: Number(opts.concurrency) > 0 ? Math.floor(Number(opts.concurrency)) : 2,
+        concurrency: Number(opts.concurrency) > 0 ? Math.max(1, Math.min(8, Math.floor(Number(opts.concurrency)))) : 6,
         filters: normalizeCrawlFilters({ ...defaultFilters, ...(opts.filters || {}), ...opts }),
         status: 'queued',
         createdAt: new Date().toISOString(),
