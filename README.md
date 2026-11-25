@@ -109,7 +109,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | 入口 | 调用 | 落盘 |
 | --- | --- | --- |
 | 关键词 | `video_crawl { "keyword": "和田大枣", "limit": 50 }` | `<爬取根>\<平台>\<关键词>\` |
-| 作者主页 | `video_crawl { "creator": "https://space.bilibili.com/3494363638270349/video", "limit": 30 }` | `<爬取根>\<平台>\<作者名>\` |
+| 作者主页 | `video_crawl { "creator": "https://space.bilibili.com/3494363638270349/video", "limit": 30 }` | `<爬取根>\<平台>\<作者名>\`（名字是链接里拿不到的就用 id） |
 
 `keyword` 与 `creator` 二选一；`platform` 不给时按链接/关键词自动判断（`bilibili.com`/`BV` 号 → bilibili，`kuaishou.com`/`kwai.com` → kuaishou）。抖音的批量通道还没实现，`detectCrawlPlatform` 故意不返回 douyin。
 
