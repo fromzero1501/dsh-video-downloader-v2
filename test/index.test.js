@@ -67,6 +67,8 @@ import {
   douyinRow,
   douyinVerdict,
 } from '../src/platforms/douyin.js'
+import { buildRequest, cookieStringOf, fakeMsToken, fingerprintOf } from '../src/platforms/douyin/http.js'
+import { isSearchPath, needsWebSignature, signWebQuery, uifidFromCookie } from '../src/platforms/douyin/websign.js'
 
 // Minimal ctx: enough for `apply` to register tools and for the pure tools to run.
 function mockCtx() {
@@ -853,3 +855,68 @@ test('refererFor picks the right anti-hotlink referer per CDN host', () => {
   assert.equal(refererFor('https://example.com/a.mp4'), '')
   assert.equal(refererFor('not a url'), '')
 })
+
+test('signWebQuery matches the reference implementation byte for byte', () => {
+  // 参考值由 CreatorHub 的 web_request.sign_web_query 在同一输入下算出（Python 侧实测）
+  const r = signWebQuery('a=1&uifid=old&timestamp=999&b=%E5%A4%A7', 'DEV123', { timestamp: 1700000000 })
+  assert.equal(
+    r.query,
+    'a=1&uifid=DEV123&b=%E5%A4%A7&timestamp=1700000000&x-secsdk-web-signature=af6244ffcb6702aefca75a53427f6408',
+  )
+  assert.equal(r.signature, 'af6244ffcb6702aefca75a53427f6408')
+  assert.deepEqual(r.headers, {
+    uifid: 'DEV123',
+    'x-secsdk-web-signature': 'af6244ffcb6702aefca75a53427f6408',
+    'x-secsdk-web-expire': '1700000000',
+  })
+  // 没有 uifid 时自动补一个；重复的 uifid 只保留第一个
+  const noDev = signWebQuery('a=1&uifid=x&uifid=y', 'DEV', { timestamp: 1 })
+  assert.match(noDev.query, /uifid=DEV/)
+  assert.equal((noDev.query.match(/uifid=/g) || []).length, 1)
+  assert.throws(() => signWebQuery('a=1', '', { timestamp: 1 }), /invalid_device_id/)
+})
+
+test('websign path rules: search unsigned, post needs both signatures', () => {
+  assert.equal(needsWebSignature('/aweme/v1/web/aweme/post/'), true)
+  assert.equal(needsWebSignature('/aweme/v1/web/aweme/post'), true)
+  assert.equal(needsWebSignature('/aweme/v1/web/user/profile/self/'), false)
+  assert.equal(isSearchPath('/aweme/v1/web/general/search/stream/'), true)
+  assert.equal(isSearchPath('/aweme/v1/web/general/search/stream'), true)
+  assert.equal(isSearchPath('/aweme/v1/web/aweme/post/'), false)
+  assert.equal(uifidFromCookie('a=1; UIFID=dev42; b=2'), 'dev42')
+  assert.equal(uifidFromCookie('uifid_lower=dev43'), '')
+  assert.equal(uifidFromCookie('uifid=lower43'), 'lower43')
+  assert.equal(uifidFromCookie(''), '')
+})
+
+test('buildRequest signs per path and never signs search', () => {
+  const cookie = 'UIFID=dev123; sessionid=abc'
+  const search = buildRequest('/aweme/v1/web/general/search/stream/', { keyword: '枣' }, { cookie })
+  assert.equal(search.signed, 'none')
+  assert.doesNotMatch(search.url, /a_bogus=/)
+  assert.match(search.url, /uifid=dev123/)
+  assert.equal(search.headers.uifid, undefined)
+
+  const post = buildRequest('/aweme/v1/web/aweme/post/', { sec_user_id: 'x' }, { cookie })
+  assert.equal(post.signed, 'abogus+web')
+  assert.match(post.url, /a_bogus=/)
+  assert.match(post.url, /x-secsdk-web-signature=/)
+  assert.equal(post.headers.uifid, 'dev123')
+  assert.ok(post.headers['x-secsdk-web-expire'])
+
+  const self = buildRequest('/aweme/v1/web/user/profile/self/', {}, { cookie })
+  assert.equal(self.signed, 'abogus')
+  assert.match(self.url, /a_bogus=/)
+  assert.match(self.url, /msToken=/)
+  assert.equal(self.headers.uifid, undefined)
+})
+
+test('cookieStringOf accepts Map, array and raw string', () => {
+  assert.equal(cookieStringOf(new Map([['a', '1'], ['b', '2']])), 'a=1; b=2')
+  assert.equal(cookieStringOf([{ name: 'a', value: '1' }, { name: '', value: 'x' }]), 'a=1')
+  assert.equal(cookieStringOf('a=1; b=2'), 'a=1; b=2')
+  assert.equal(cookieStringOf(null), '')
+  assert.equal(fakeMsToken().length, 126)
+  assert.match(fingerprintOf(), /^1536\|864\|1560\|944\|/)
+})
+

@@ -166,7 +166,21 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 ### 抖音
 
-**不移植 a_bogus**：抖音网页接口的 `a_bogus` / `msToken` 随版本变，硬算出来的签名活不了几天。所以这条通道起一个**有头 Edge + 持久 profile**，打开 `https://www.douyin.com/jingxuan` 后在**页面内** `fetch` 官方接口，让抖音自己的运行时把易变安全字段补上——我们只负责参数与解码。
+**签名已自带**：`a_bogus` 与设备号绑定的 `x-secsdk-web-signature` 都移植成了纯 JS（`src/platforms/douyin/abogus.js`、`websign.js`），后者与参考实现的输出**逐字节一致**（同一输入算出的 32 位 hex 相同）。于是：
+
+| 用途 | 通道 | 说明 |
+| --- | --- | --- |
+| 账号资料（昵称 / uid） | **纯 HTTP** | `/aweme/v1/web/user/profile/self/` + `a_bogus`，不用开浏览器 |
+| 作者主页作品 | **纯 HTTP** | `/aweme/v1/web/aweme/post/`，需要 `a_bogus` + 设备号签名 + 三个请求头 |
+| 关键词搜索 | **浏览器**（纯 HTTP 只是先试一次） | `general/search/stream/` 纯 HTTP 只回**精简卡片**（有 `aweme_id`/`author`，没有 `desc`/`statistics`/`play_addr`），下不了也筛不了；且连续请求会进 `verify_check` 风控 |
+
+三条签名规则（实测，写死在 `http.js` 的 `buildRequest` 里）：
+
+1. **搜索族不签名**：`general/search/single|stream/` 加 `a_bogus` 反被判风控（返回 `search_nil_type: verify_check`），不加才出数据；设备号放 query 里的 `uifid`。
+2. **受保护路径双签**：`aweme/post/` 这类除了 `a_bogus` 还要 `x-secsdk-web-signature`，缺一样就 403——不带设备号是 `Uifid Not Found`，带了不签是 `Signature Not Found`。
+3. **其余只签 `a_bogus`**：例如 `profile/self/`，再补一个 `msToken`（cookie 里没有就随机假 token）。
+
+设备号取 cookie 里的 `UIFID`（大小写多种都试过，实际只有大写有值）。登录后整段 cookie 落盘到 `<DSH_HOME>\video-downloader\douyin\cookies.json`，纯 HTTP 通道靠它工作；cookie 失效时才需要再开一次浏览器扫码。
 
 | 入口 | 接口 | 分页 |
 | --- | --- | --- |
@@ -187,7 +201,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 | | 快手 | B站 | 抖音 |
 | --- | --- | --- | --- |
-| 搜索通道 | 有头 Edge + 页面内现签名 | 纯 HTTP + wbi 签名 | 有头 Edge + 页面内 fetch（自己不打签名） |
+| 搜索通道 | 有头 Edge + 页面内现签名 | 纯 HTTP + wbi 签名 | 浏览器优先（纯 HTTP 只回精简卡片） |
 | 登录 | 必须（首次扫码，持久 profile） | 不需要 | 必须（首次扫码，持久 profile） |
 | 关键词分页 | `pcursor` | 页码 `page` | `offset` |
 | 作者主页 | `/rest/v/profile/feed` | `/x/space/wbi/arc/search` | `/aweme/v1/web/aweme/post/` |
@@ -309,7 +323,7 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（快手/B站/抖音）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞）、抖音 chunked 帧解码与错误分流、抖音行映射（缺字段保持 undefined，封面/音乐 URL 不当视频）、抖音文件名与游标抽取，以及抗盗链 referer 归属与八个工具的注册与错误分支。当前 55 个用例。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、快手搜索返回码归因、快手流挑选与字段归一（含 HLS 优先降级）、快手法文件名、爬取筛选（时间/点赞/播放量）、爬取索引去重、HLS 播放列表地址补全、各环节耗时汇总（`summarizeTimings`）、流水线取任务与下载看门狗判定、平台自动识别（快手/B站/抖音）、平台注册表与点赞筛选能力声明、B站 wbi 签名与行字段映射（作者入口不伪造点赞）、抖音 chunked 帧解码与错误分流、抖音行映射（缺字段保持 undefined，封面/音乐 URL 不当视频）、抖音文件名与游标抽取、抖音两套签名的路径规则（搜索族不签、作者作品双签、资料只签 `a_bogus`）与设备号绑定签名和参考实现的一致性，以及抗盗链 referer 归属与八个工具的注册与错误分支。当前 59 个用例。
 
 ## 许可证
 

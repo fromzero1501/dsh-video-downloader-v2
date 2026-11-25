@@ -1,17 +1,20 @@
 /**
- * 抖音通道：不移植 a_bogus。
+ * 抖音通道：浏览器与纯 HTTP 双轨。
  *
- * 做法跟 CreatorHub 一致——打开 douyin.com 的页面，在**页面内** fetch 官方接口，
- * 让抖音自己的 SecSDK 往请求上追加 a_bogus / msToken 这类随版本变的安全字段。
- * 我们只负责参数与解码，不碰签名算法（算法一变就得跟着改，维护成本极高）。
+ * - **纯 HTTP（首选）**：`./douyin/http.js` 自带 a_bogus 与设备号绑定签名，
+ *   搜索族不签名、作者作品接口加 `x-secsdk-web-signature`，实测都能直连。
+ *   代价是必须有一份有效 cookie，所以登录后把 cookie 落盘复用。
+ * - **浏览器（登录 / 兜底）**：cookie 失效、或接口改版时，退回打开 douyin.com
+ *   页面内 fetch，让第一方运行时自己补安全字段。
  *
  * 两个接口：
  *   搜索   GET /aweme/v1/web/general/search/stream/   ← 返回是 chunked JSON 流
  *   作者作品 GET /aweme/v1/web/aweme/post/            ← 普通 JSON
  */
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { createDouyinHttp, cookieStringOf } from './douyin/http.js'
 
 const DOUYIN_ORIGIN = 'https://www.douyin.com'
 const WARM_URL = 'https://www.douyin.com/jingxuan'
@@ -429,6 +432,149 @@ export async function openDouyinSession({ profileDir, log = () => {}, signal, po
   }
 }
 
+/* ---------------------------------------------------- 纯 HTTP 通道（免开浏览器） */
+
+/** 把多帧 payload 里的 aweme 汇总去重，保住首次出现的顺序。 */
+export function mergeFrameAwemes(frames) {
+  const seen = new Set()
+  const out = []
+  for (const f of Array.isArray(frames) ? frames : []) {
+    for (const a of douyinExtractAwemes(f)) {
+      const id = a?.aweme_id
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      out.push(a)
+    }
+  }
+  return out
+}
+
+/** 从多帧里挑出一个 verdict（取第一个带 status_code 的帧；都没有就按无数据处理）。 */
+function verdictOfFrames(frames) {
+  for (const f of frames) {
+    if (f && f.status_code !== undefined) return douyinVerdict(f)
+  }
+  return { kind: 'blocked', message: '响应里没有可解析的帧' }
+}
+
+/** 从多帧里取下一页游标与 has_more。 */
+function pageStateOfFrames(frames) {
+  let cursor = ''
+  let hasMore = false
+  let searchId = ''
+  for (const f of frames) {
+    if (!f) continue
+    const st = douyinPageState(f)
+    if (st.next) cursor = String(st.next)
+    if (st.hasMore) hasMore = true
+    if (st.searchId) searchId = st.searchId
+  }
+  return { cursor, hasMore, searchSessionId: searchId }
+}
+
+/**
+ * 纯 HTTP 关键词搜索。
+ * @returns {{verdict:object, rows:object[], cursor:string, hasMore:boolean, searchSessionId?:string, authorName?:string, transport?:string}}
+ */
+export async function searchViaHttp(stateDir, { keyword, cursor = '', sessionId = '' } = {}) {
+  const cookie = loadCookieJar(stateDir)
+  if (!cookie) return { verdict: { kind: 'need_login', message: '没有存盘的抖音 cookie' }, rows: [], cursor: '', hasMore: false }
+  const http = createDouyinHttp({ cookie })
+  const offset = Number(cursor) || 0
+  const params = {
+    keyword,
+    offset: String(offset),
+    count: String(SEARCH_PAGE_SIZE),
+    search_channel: 'aweme_general',
+    search_source: 'normal_search',
+    query_correct_type: '1',
+    is_filter_search: '0',
+  }
+  if (sessionId) params.search_id = sessionId
+  const r = await http.request(SEARCH_PATH, params, {
+    referer: `https://www.douyin.com/search/${encodeURIComponent(keyword)}`,
+  })
+  if (r.status === 401) return { verdict: { kind: 'need_login', message: '抖音登录态失效' }, rows: [], cursor: '', hasMore: false }
+  if (r.status === 403 || r.status === 429) {
+    return { verdict: { kind: 'blocked', message: `抖音拒绝了请求（HTTP ${r.status}）` }, rows: [], cursor: '', hasMore: false }
+  }
+  const frames = decodeDouyinPayloads(r.text)
+  const verdict = verdictOfFrames(frames)
+  const rows = mergeFrameAwemes(frames).map((a) => douyinRow(a, { source: 'search' }))
+  const page = pageStateOfFrames(frames)
+  // 接口在风控态下会返回空数组 + search_nil_type=verify_check，这种情况要按验证处理
+  const nil = frames.map((f) => f?.search_nil_info?.search_nil_type).find(Boolean) || ''
+  const finalVerdict = verdict.kind === 'ok' && !rows.length && /verify|captcha|risk/.test(nil)
+    ? { kind: 'captcha', message: '抖音要求验证（search_nil_type=verify_check）' }
+    : verdict
+  return {
+    verdict: finalVerdict,
+    rows,
+    cursor: page.cursor || (rows.length ? String(offset + SEARCH_PAGE_SIZE) : ''),
+    hasMore: page.hasMore,
+    searchSessionId: page.searchSessionId || sessionId,
+    authorName: rows[0]?.author || '',
+    transport: 'http',
+  }
+}
+
+/** 纯 HTTP 拉作者作品。 */
+export async function listCreatorViaHttp(stateDir, { creatorId, cursor = '' } = {}) {
+  const cookie = loadCookieJar(stateDir)
+  if (!cookie) return { verdict: { kind: 'need_login', message: '没有存盘的抖音 cookie' }, rows: [], cursor: '', hasMore: false }
+  const http = createDouyinHttp({ cookie })
+  const r = await http.request(
+    POST_PATH,
+    { sec_user_id: creatorId, max_cursor: String(Number(cursor) || 0), count: '20', publish_video_strategy_type: '2' },
+    { referer: `https://www.douyin.com/user/${creatorId}` },
+  )
+  if (r.status === 401) return { verdict: { kind: 'need_login', message: '抖音登录态失效' }, rows: [], cursor: '', hasMore: false }
+  if (r.status === 403 || r.status === 429) {
+    return { verdict: { kind: 'blocked', message: `抖音拒绝了请求（HTTP ${r.status}）` }, rows: [], cursor: '', hasMore: false }
+  }
+  const payload = decodeDouyinPayloads(r.text)[0] || null
+  if (!payload) return { verdict: { kind: 'blocked', message: '作者作品接口没有返回可解析的 JSON' }, rows: [], cursor: '', hasMore: false }
+  const verdict = douyinVerdict(payload)
+  const rows = douyinExtractAwemes(payload).map((a) => douyinRow(a, { source: 'creator' }))
+  const page = douyinPageState(payload)
+  return {
+    verdict,
+    rows,
+    cursor: page.next ? String(page.next) : '',
+    hasMore: page.hasMore,
+    authorName: rows[0]?.author || '',
+    transport: 'http',
+  }
+}
+
+/* ------------------------------------------------------- 登录态（cookie jar） */
+
+/** cookie 落盘位置：<stateDir>/douyin/cookies.json */
+export function cookiesFileOf(stateDir) {
+  return `${stateDir}/douyin/cookies.json`
+}
+
+/** 读存盘 cookie；没有或坏了返回 ''。 */
+export function loadCookieJar(stateDir) {
+  try {
+    const j = JSON.parse(readFileSync(cookiesFileOf(stateDir), 'utf8'))
+    const cookie = typeof j === 'string' ? j : j?.cookie
+    return typeof cookie === 'string' ? cookie : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 存 cookie（只在内容变化时写，避免无谓 IO）。返回是否写了。 */
+export function saveCookieJar(stateDir, cookie) {
+  const text = String(cookie || '')
+  if (!text) return false
+  if (text === loadCookieJar(stateDir)) return false
+  mkdirSync(`${stateDir}/douyin`, { recursive: true })
+  writeFileSync(cookiesFileOf(stateDir), JSON.stringify({ savedAt: new Date().toISOString(), length: text.length, cookie: text }), 'utf8')
+  return true
+}
+
 /* ------------------------------------------------------------------ 适配器 */
 
 export function createDouyinAdapter() {
@@ -442,12 +588,38 @@ export function createDouyinAdapter() {
     profileDir: (stateDir) => `${stateDir}/douyin/profile`,
 
     async openSession({ stateDir, log, signal, blockMedia = false } = {}) {
-      return openDouyinSession({ profileDir: `${stateDir}/douyin/profile`, log, signal, blockMedia })
+      const session = await openDouyinSession({ profileDir: `${stateDir}/douyin/profile`, log, signal, blockMedia })
+      // 记住 stateDir：纯 HTTP 通道要靠它找存盘的 cookie
+      try {
+        session.stateDir = stateDir
+      } catch {
+        /* frozen 就算了 */
+      }
+      // 顺手把当前浏览器 cookie 存一份，供纯 HTTP 复用（浏览器只开这一次）
+      try {
+        const jar = await session.readCookies?.()
+        const text = cookieStringOf(jar)
+        if (text && saveCookieJar(stateDir, text)) log(`抖音 cookie 已存盘（${text.length} 字符）`)
+      } catch {
+        /* 存不上不影响浏览器通道 */
+      }
+      return session
     },
 
     /** 没有登录态就没法搜索（接口直接回 2483），所以这里必须等用户扫码。 */
     async ensureLogin(session, { stateDir, jobId, log = () => {}, signal, onNeedHuman, waitMs = 180000 } = {}) {
-      if (await session.hasLogin()) return { ok: true, loggedIn: true }
+      const persist = async () => {
+        try {
+          const text = cookieStringOf(await session.readCookies?.())
+          if (text) saveCookieJar(stateDir, text)
+        } catch {
+          /* 忽略 */
+        }
+      }
+      if (await session.hasLogin()) {
+        await persist()
+        return { ok: true, loggedIn: true }
+      }
       const shot = `${stateDir}/douyin-${jobId || 'login'}.png`
       log('抖音未登录：需要扫码（搜索接口未登录直接拒绝）')
       try { await session.screenshot(shot) } catch {}
@@ -457,12 +629,39 @@ export function createDouyinAdapter() {
       while (Date.now() < deadline) {
         if (signal?.aborted) return { ok: false, reason: 'canceled', message: '已取消' }
         await sleep(3000)
-        if (await session.hasLogin()) { log('抖音登录态已就绪'); return { ok: true, loggedIn: true } }
+        if (await session.hasLogin()) {
+          await persist()
+          log('抖音登录态已就绪，cookie 已存盘')
+          return { ok: true, loggedIn: true }
+        }
       }
       return { ok: false, reason: 'need_login', message: `抖音登录超时（${Math.round(budget / 1000)} 秒）：请在弹出的浏览器里扫码后 resume`, screenshot: shot }
     },
 
+    /**
+     * 关键词搜索：先走纯 HTTP（自带签名，不开浏览器），
+     * 只有在「没 cookie / 登录失效」这类需要浏览器介入的情况下才回退页面内 fetch。
+     *
+     * 注意：实测 `general/search/stream/` 在纯 HTTP 下常返回**精简卡片**
+     * （只有 aweme_id/author/video.bit_rate，没有 desc/statistics/play_addr），
+     * 这种行全部 `source.kind === 'missing'`，下不了、也筛不了点赞，等于没用。
+     * 所以只有「能直接下」的行占比过半时才采用 HTTP 结果，否则回退浏览器通道。
+     */
     async searchKeyword(session, { keyword, cursor = '', sessionId = '' } = {}) {
+      const stateDir = session?.stateDir
+      if (stateDir) {
+        try {
+          const viaHttp = await searchViaHttp(stateDir, { keyword, cursor, sessionId })
+          const usable = viaHttp.rows.filter((r) => r?.source?.kind === 'direct').length
+          if (viaHttp.verdict?.kind === 'ok' && usable * 2 >= viaHttp.rows.length && usable > 0) return viaHttp
+          if (viaHttp.verdict?.kind === 'captcha' || viaHttp.verdict?.kind === 'rate_limited') {
+            // 风控/限流不该再拿浏览器去撞，直接上报给调度层冷却
+            return viaHttp
+          }
+        } catch {
+          /* 落到浏览器通道 */
+        }
+      }
       const r = await session.searchOnce({ keyword, cursor, sessionId })
       return {
         verdict: r.verdict,
@@ -475,6 +674,18 @@ export function createDouyinAdapter() {
     },
 
     async listCreator(session, { creatorId, cursor = '' } = {}) {
+      const stateDir = session?.stateDir
+      if (stateDir) {
+        try {
+          const viaHttp = await listCreatorViaHttp(stateDir, { creatorId, cursor })
+          if (viaHttp.verdict?.kind === 'ok') return viaHttp
+          if (viaHttp.verdict?.kind === 'captcha' || viaHttp.verdict?.kind === 'rate_limited' || viaHttp.verdict?.kind === 'blocked' || viaHttp.verdict?.kind === 'need_login') {
+            if (viaHttp.verdict.kind !== 'need_login') return viaHttp
+          }
+        } catch {
+          /* 落到浏览器通道 */
+        }
+      }
       const r = await session.profileOnce({ secUserId: creatorId, cursor })
       return {
         verdict: r.verdict,
@@ -486,13 +697,36 @@ export function createDouyinAdapter() {
     },
 
     /**
-     * 登录态下取自己的昵称，供设置页「账号」栏显示。
-     * 实测 `/aweme/v1/web/user/profile/self/` 即使带着有效 sessionid 也回
-     * status_code 8「用户未登录」（该接口要页面签名），所以走 `/user/self` 页面的 DOM，
-     * `h1` 就是昵称。抖音号（`[data-e2e="user-info"]`）在 textContent 里与「N岁/关注/粉丝」
-     * 拼在一起、位数不固定，取出来会多一两位，所以 id 改用 cookie 里的 uid_tt。
+     * 登录态下取自己的昵称与账号 id，供设置页「账号」栏显示。
+     *
+     * 首选纯 HTTP：`/aweme/v1/web/user/profile/self/` 配上 a_bogus 后直接回
+     * `{nickname, uid, sec_uid}`，不用开页面。cookie 优先用存盘的那份，
+     * 没有就用当前浏览器会话的（顺便落盘）。
+     * 兜底才退回 DOM：`/user/self` 页面的 `h1` 是昵称。
      */
-    async account(session) {
+    async account(session, { stateDir } = {}) {
+      const dir = stateDir || session?.stateDir || ''
+      // --- 纯 HTTP ---
+      if (dir) {
+        try {
+          let cookie = loadCookieJar(dir)
+          if (!cookie && session?.readCookies) {
+            cookie = cookieStringOf(await session.readCookies())
+            if (cookie) saveCookieJar(dir, cookie)
+          }
+          if (cookie) {
+            const http = createDouyinHttp({ cookie })
+            const payload = await http.selfProfile()
+            const user = payload?.user || (payload?.status_code === 0 ? null : null)
+            if (payload?.status_code === 0 && user?.nickname) {
+              return { name: String(user.nickname), id: String(user.uid || ''), secUid: String(user.sec_uid || '') }
+            }
+          }
+        } catch {
+          /* 落到 DOM */
+        }
+      }
+      // --- DOM 兜底 ---
       try {
         if (session?.goto) await session.goto('https://www.douyin.com/user/self', 2500)
         const probe = `(() => {
