@@ -38,6 +38,7 @@ import {
   indexHit,
   absolutizePlaylist,
   CRAWL_TUNING_DEFAULTS,
+  KEYWORD_GAP_BY_PLATFORM,
   DOWNLOAD_STALL_MS,
   isRetryableDownloadError,
   loadCrawlIndex,
@@ -49,6 +50,7 @@ import {
   refererFor,
   safeDirName,
   sortCrawlRows,
+  videoContainerKind,
   summarizeTimings,
 } from '../src/crawl.js'
 import {
@@ -961,6 +963,30 @@ test('reachedCrawlBoundary trips only after N consecutive all-seen pages', () =>
   // 自定义窗口，且非法值回落 3
   assert.equal(reachedCrawlBoundary({ stalePages: 1, staleLimit: 1 }), true)
   assert.equal(reachedCrawlBoundary({ stalePages: 2, staleLimit: 0 }), false)
+})
+
+test('reachedCrawlBoundary also stops on a page that is entirely older than the time window', () => {
+  // 整页都太旧（不带「都见过」也能判到底）
+  assert.equal(reachedCrawlBoundary({ tooOld: 20, pageRows: 20 }), true)
+  assert.equal(reachedCrawlBoundary({ tooOld: 19, pageRows: 20 }), false)
+  // 空页不触发，也别让 0/0 误判
+  assert.equal(reachedCrawlBoundary({ tooOld: 0, pageRows: 0 }), false)
+  // 关掉增量时两条判据都不生效
+  assert.equal(reachedCrawlBoundary({ tooOld: 20, pageRows: 20, incremental: false }), false)
+})
+
+test('KEYWORD_GAP_BY_PLATFORM keeps per-platform gaps and videoContainerKind rejects non-video payloads', () => {
+  assert.equal(KEYWORD_GAP_BY_PLATFORM.kuaishou, 3000)
+  assert.ok(KEYWORD_GAP_BY_PLATFORM.bilibili > 0 && KEYWORD_GAP_BY_PLATFORM.douyin > 0)
+
+  const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from('ftypisom'), Buffer.alloc(32)])
+  assert.equal(videoContainerKind(mp4), 'mp4')
+  assert.equal(videoContainerKind(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4])), 'webm')
+  assert.equal(videoContainerKind(Buffer.from('FLV\x01rest-of-header', 'latin1')), 'flv')
+  // CDN 抽风时回的是网页或 JSON，长度照样对得上，但不能当视频存
+  assert.equal(videoContainerKind(Buffer.from('<!DOCTYPE html><html><body>403</body></html>')), '')
+  assert.equal(videoContainerKind(Buffer.from('{"status_code":0,"data":[]}')), '')
+  assert.equal(videoContainerKind(Buffer.alloc(0)), '')
 })
 
 test('sortCrawlRows orders by time or likes and keeps the source array intact', () => {

@@ -128,11 +128,19 @@ export function normalizeCrawlFilters(raw = {}) {
 /**
  * 增量边界：连续多少页全是「索引里已经下过」的作品，就认为翻到了上次的尽头。
  * 判据只数「没见过」的条数，不看筛选结果——否则一页被最低点赞全筛掉时会被误判成到底。
+ *
+ * 第二条判据是时间窗：整页（含被筛掉的）都早于 maxAgeDays 时也算到底。
+ * 作者主页按时间倒序，这一条通常比「都见过」更早命中；关键词搜索按相关度排，
+ * 命中的是「已经翻到旧内容区」，同样该停。
  */
-export function reachedCrawlBoundary({ stalePages = 0, staleLimit = 3, incremental = true } = {}) {
+export function reachedCrawlBoundary({
+  stalePages = 0, staleLimit = 3, incremental = true, tooOld = 0, pageRows = 0,
+} = {}) {
   if (incremental === false) return false
   const limit = Math.max(1, Number(staleLimit) || 3)
-  return Number(stalePages) >= limit
+  if (Number(stalePages) >= limit) return true
+  const rows = Number(pageRows) || 0
+  return rows > 0 && (Number(tooOld) || 0) >= rows
 }
 
 /**
@@ -208,7 +216,7 @@ export function pickDownloadTask({ cursor = 0, foundLength = 0, limit = 0, searc
 export function isRetryableDownloadError(message) {
   const text = String(message || '')
   if (/HTTP 4\d\d/.test(text)) return false
-  return /没有任何数据|响应被截断|单条超过|HTTP 5\d\d|fetch failed|socket|ECONNRESET|ETIMEDOUT|aborted|terminated|other side closed|premature close|UND_ERR/i.test(text)
+  return /没有任何数据|响应被截断|单条超过|HTTP 5\d\d|fetch failed|socket|ECONNRESET|ETIMEDOUT|aborted|terminated|other side closed|premature close|UND_ERR|不是视频容器/i.test(text)
 }
 
 /** 单条连接「停滞」多久算卡死：连续这么久没有任何字节进来就断开重连。
@@ -233,6 +241,37 @@ function readHead(file, bytes = 256) {
   } finally {
     if (fd >= 0) try { closeSync(fd) } catch {}
   }
+}
+
+/** 读文件头几个字节（原始字节版，容器签名要按字节判）。 */
+function readHeadBytes(file, bytes = 4096) {
+  let fd = -1
+  try {
+    fd = openSync(file, 'r')
+    const buf = Buffer.alloc(bytes)
+    const len = readSync(fd, buf, 0, bytes, 0)
+    return buf.subarray(0, len)
+  } catch {
+    return Buffer.alloc(0)
+  } finally {
+    if (fd >= 0) try { closeSync(fd) } catch {}
+  }
+}
+
+/**
+ * 落盘的到底是视频容器还是 HTML/JSON/封面图？纯函数。
+ * 返回 'mp4' | 'webm' | 'flv' | 'mpeg' | ''（空串 = 不认识）。
+ * mp4 认 box 名：ftyp/moov/mdat/moof/styp 任意一个出现在前 4KB 里即可
+ * （有些文件 mdat 在前、moov 在尾，只看头 8 字节会误判）。
+ */
+export function videoContainerKind(input) {
+  const data = Buffer.isBuffer(input) ? input : Buffer.from(String(input ?? ''), 'latin1')
+  if (data.length < 8) return ''
+  if (data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) return 'webm'
+  if (data.subarray(0, 3).toString('latin1') === 'FLV') return 'flv'
+  if (data[0] === 0x00 && data[1] === 0x00 && data[2] === 0x01 && data[3] === 0xba) return 'mpeg'
+  if (/(ftyp|moov|mdat|moof|styp)/.test(data.subarray(0, 4096).toString('latin1'))) return 'mp4'
+  return ''
 }
 
 /**
@@ -358,9 +397,11 @@ export async function downloadDirect(url, file, {
       : null
     try {
       let have = sizeOf(part)
-      const request = (resume) => {
+      const request = (resume, { close = false } = {}) => {
         const h = headersFor(target)
         if (resume > 0) h.range = `bytes=${resume}-`
+        // 502/503/504 多半是边缘节点坏了：带 Connection: close 换一条新连接，别复用那条坏链路。
+        if (close) h.connection = 'close'
         return fetch(target, { headers: h, signal: ctrl.signal, redirect: 'follow' })
       }
       let res = await request(have)
@@ -374,6 +415,13 @@ export async function downloadDirect(url, file, {
         rmSync(part, { force: true })
         have = 0
         res = await request(0)
+      }
+      // 5xx 是边缘节点/网关的临时故障：换一条连接（Connection: close）带一点抖动量试一次，
+      // 比直接放弃再走外层重排更省时间。
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        try { await res.body?.cancel() } catch {}
+        await sleep(300 + Math.floor(Math.random() * 400))
+        res = await request(have, { close: true })
       }
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`)
       // 类型闸门：拿到的不是视频就别存成 .mp4（踩过：把封面图存成了 mp4）。
@@ -401,6 +449,12 @@ export async function downloadDirect(url, file, {
       if (total > 0 && have + bytes < total) {
         throw new Error(`只下到 ${have + bytes}/${total} 字节，响应被截断`)
       }
+      // 落盘前判一次容器：CDN 抽风时会回一页 HTML / 一段 JSON，长度对得上但根本不是视频。
+      // HLS 播放列表是合法的中间产物（随后交给 ffmpeg 合并），放行。
+      if (!readHead(part, 16).startsWith(HLS_MAGIC)) {
+        const kind = videoContainerKind(readHeadBytes(part))
+        if (!kind) throw new Error('落盘的不是视频容器（找不到 ftyp/moov/mdat）')
+      }
       renameSync(part, file)
       return sizeOf(file)
     } finally {
@@ -422,7 +476,7 @@ export async function downloadDirect(url, file, {
     } catch (err) {
       lastErr = err
       // 半截的 .part 留着，下次（或下一个候选）接着续；但如果拿回来的压根不是视频，那半截就是垃圾。
-      if (/返回的不是视频|HTTP 4\d\d/.test(String(err?.message || ''))) {
+      if (/返回的不是视频|不是视频容器|HTTP 4\d\d/.test(String(err?.message || ''))) {
         try { rmSync(part, { force: true }) } catch {}
       }
       try { rmSync(file, { force: true }) } catch {}
@@ -457,6 +511,13 @@ export const CRAWL_TUNING_DEFAULTS = {
   blockMedia: false,     // 屏蔽图片/视频/字体请求（抖音开了会拿不到数据，默认关）
   stalePages: 3,         // 连续这么多页全是已下过的，就判定翻到了上次的边界
 }
+
+/**
+ * 平台级关键词间隔下限（毫秒）。实测：快手同一批词连打必被限流（10 分钟内连跑会进 result=2），
+ * B站 自己有 1.1 秒排队且 -352 是频率风控，抖音风控最敏感。
+ * 设置页的 keywordGapMs 仍然生效，实际取两者大的那个。
+ */
+export const KEYWORD_GAP_BY_PLATFORM = { kuaishou: 3000, bilibili: 1500, douyin: 2500 }
 
 export function createCrawler({
   stateDir,
@@ -570,12 +631,17 @@ export function createCrawler({
     const absorb = (rows, label) => {
       const before = job.found.length
       job.stats.searched += rows.length
+      const days = Number(job.filters.maxAgeDays) || 0
+      // 时间窗边界要单独数：这些条会被筛掉，但仍能说明「已经翻到旧内容区」。
+      const cutoff = days > 0 ? Date.now() - days * 86400000 : 0
       let unseen = 0
+      let tooOld = 0
       const keep = []
       for (const row of rows) {
         // 「新」按索引判断，不受筛选影响：筛选挡掉的也算翻到了新内容，否则会被误判到底。
         const isNew = !known(row.id)
         if (isNew) unseen += 1
+        if (cutoff && Number(row.timestampMs) > 0 && Number(row.timestampMs) < cutoff) tooOld += 1
         if (seenLocal.has(row.id)) continue
         seenLocal.add(row.id)
         if (!passesCrawlFilter(row, job.filters)) { job.stats.filtered += 1; continue }
@@ -586,7 +652,7 @@ export function createCrawler({
       // 页内再排一次：平台接口的排序能力不齐（快手搜索没有排序参数），统一口径只能在这里落。
       for (const row of sortCrawlRows(keep, job.sort)) job.found.push({ ...row, keyword: label })
       job.stats.found = job.found.length
-      return { rows: rows.length, kept: job.found.length - before, unseen }
+      return { rows: rows.length, kept: job.found.length - before, unseen, tooOld }
     }
 
     /**
@@ -594,7 +660,17 @@ export function createCrawler({
      * 作者主页按时间倒序，这个判据很准；关键词搜素按相关度排序，重复跑同一词时前三页就覆盖了主要结果。
      */
     const staleLimit = Math.max(1, Number(T.stalePages) || 3)
-    const reachedBoundary = (stalePages) => reachedCrawlBoundary({ stalePages, staleLimit, incremental: job.incremental })
+    const reachedBoundary = (stalePages, counted = {}) => reachedCrawlBoundary({
+      stalePages,
+      staleLimit,
+      incremental: job.incremental,
+      tooOld: counted.tooOld || 0,
+      pageRows: counted.rows || 0,
+    })
+    /** 到底是「连着几页都见过」还是「整页都太旧」触发的边界，写给人看的话术不一样。 */
+    const boundaryReason = (label, stalePages, counted) => (stalePages >= staleLimit
+      ? `「${label}」连续 ${stalePages} 页都是已下过的作品`
+      : `「${label}」整页 ${counted.rows} 条都早于最近 ${job.filters.maxAgeDays} 天`)
 
     /** 限流退避返回 'retry'；需要人工的一律抛 PauseSignal 交给外层落状态。 */
     const handleVerdict = async (verdict) => {
@@ -616,8 +692,10 @@ export function createCrawler({
       return base + Math.floor(Math.random() * 1000)
     }
     // 换关键词之间也要停一下：实测同一关键词连打必被限流，换词不停顿同样会累计风控。
+    // 平台各自的间隔下限见 KEYWORD_GAP_BY_PLATFORM，取两者大的那个。
     const keywordGap = async () => {
-      const base = Math.max(0, Number(T.keywordGapMs) || 0)
+      const byPlatform = Number(KEYWORD_GAP_BY_PLATFORM[job.platform]) || 0
+      const base = Math.max(0, Number(T.keywordGapMs) || 0, byPlatform)
       if (!base) return
       const jitter = base * (Math.random() * 0.7 - 0.35)
       await sleep(Math.round(base + jitter))
@@ -649,8 +727,8 @@ export function createCrawler({
         // 整页都是已下过的 → 已经翻到上次的边界，没必要再往下翻。
         if (counted.rows > 0) {
           stalePages = counted.unseen > 0 ? 0 : stalePages + 1
-          if (reachedBoundary(stalePages)) {
-            job.boundaryHit = `连续 ${stalePages} 页都是已下过的作品`
+          if (reachedBoundary(stalePages, counted)) {
+            job.boundaryHit = boundaryReason(label, stalePages, counted)
             log(`增量边界：${job.boundaryHit}，停止翻页`)
             return fresh >= job.limit
           }
@@ -699,8 +777,8 @@ export function createCrawler({
         // 同一个词连着几页全是已下过的 → 重复跑的这个词已经没什么新东西，换下一个词更划算。
         if (counted.rows > 0) {
           stalePages = counted.unseen > 0 ? 0 : stalePages + 1
-          if (reachedBoundary(stalePages)) {
-            job.boundaryHit = `「${word}」连续 ${stalePages} 页都是已下过的作品`
+          if (reachedBoundary(stalePages, counted)) {
+            job.boundaryHit = boundaryReason(word, stalePages, counted)
             log(`增量边界：${job.boundaryHit}，换下一个关键词`)
             break
           }
@@ -735,7 +813,8 @@ export function createCrawler({
     const concurrency = Math.max(1, Math.min(want, cap))
     let cursor = 0
     let attempted = 0
-    let retried = 0
+    // 重试额度按条算（曾经是一个全局计数器：一条烂链路会把整批的额度吃光）。
+    const retriedBy = new Map()
 
     const worker = async () => {
       for (;;) {
@@ -784,9 +863,15 @@ export function createCrawler({
           job.stats.downloaded += 1
           job.stats.bytes += bytes
           try {
+            // 索引除了去重键，也留一份元数据：以后做增量/统计/重下不必再打一遍接口。
+            // 字段缺失（抖音作者入口没有点赞、快手不给时长）就不写，不补 0 造假的 0。
             appendFileSync(indexFile, JSON.stringify({
-              platform: job.platform, id: row.id, file, bytes, keyword: job.keyword,
-              caption: row.caption.slice(0, 80), author: row.author,
+              platform: job.platform, id: row.id, file, bytes,
+              keyword: job.keyword, source: job.source,
+              caption: String(row.caption || '').slice(0, 80), author: row.author, authorId: row.authorId,
+              durationMs: row.durationMs, timestampMs: row.timestampMs,
+              likeCount: row.likeCount, viewCount: row.viewCount,
+              quality: job.quality || undefined,
               at: new Date().toISOString(), jobId: job.id,
             }) + '\n', 'utf8')
           } catch (err) {
@@ -797,12 +882,15 @@ export function createCrawler({
         } catch (err) {
           if (signal.aborted) throw Object.assign(new Error('已取消'), { code: 'canceled' })
           // 卡死/截断：回队列重连一次，别让一条烂连接把整批拖住。
-          if (isRetryableDownloadError(err?.message) && retried < Math.max(3, concurrency)) {
-            retried += 1
+          const used = retriedBy.get(row.id) || 0
+          if (isRetryableDownloadError(err?.message) && used < Math.max(3, concurrency)) {
+            retriedBy.set(row.id, used + 1)
             cursor -= 1
             job.timings.items.push({ id: row.id, ms: Date.now() - itemStartedAt, bytes: 0, ok: false, retry: true })
-            log(`下载重连 ${row.id}（第 ${retried} 次）：${err?.message || err}`)
-            await sleep(500)
+            // 退避带抖动：几个 worker 被同一条坏链路一起打回时，别在同一毫秒齐刷刷重来。
+            const backoff = Math.min(8000, 500 * (used + 2)) * (0.85 + Math.random() * 0.3)
+            log(`下载重连 ${row.id}（第 ${used + 1} 次，等 ${Math.round(backoff)}ms）：${err?.message || err}`)
+            await sleep(Math.round(backoff))
             continue
           }
           row.status = 'failed'
