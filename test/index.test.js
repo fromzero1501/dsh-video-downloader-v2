@@ -44,6 +44,7 @@ import {
   passesCrawlFilter,
   pickDownloadTask,
   platformLabel,
+  refererFor,
   safeDirName,
   summarizeTimings,
 } from '../src/crawl.js'
@@ -56,6 +57,7 @@ import {
 } from '../src/kuaishou.js'
 import { createPlatformRegistry, detectCrawlPlatform } from '../src/platforms/index.js'
 import { BILI_DM_PARAMS, biliRow, cleanBiliTitle, createBilibiliAdapter, wbiSign } from '../src/platforms/bilibili.js'
+import { createDouyinAdapter } from '../src/platforms/douyin.js'
 import {
   decodeDouyinPayloads,
   douyinExtractAwemes,
@@ -790,6 +792,40 @@ test('douyin row keeps missing stats undefined and picks the direct play url', (
   assert.equal(bare.likeCount, undefined)
   assert.equal(bare.source.url, '')
   assert.equal(douyinRow({ desc: 'no id' }), null)
+
+  // play_addr 里混进音乐/封面时不能当视频下（实测踩过：存出来的不是视频）
+  const mixed = douyinRow({
+    aweme_id: '3',
+    statistics: { digg_count: 10, play_count: 0 },
+    video: {
+      play_addr: {
+        url_list: [
+          'https://sf26-sign.douyinstatic.com/tos-cn-ve-2774/obj/cover.jpeg',
+          'https://lf26-music-east.douyinstatic.com/obj/ies-music/abc.mp3',
+          'https://v26-web.douyinvod.com/abc/video/tos/cn/tos-cn-ve-2774/xyz/?a=1',
+        ],
+      },
+    },
+  })
+  assert.equal(mixed.source.url, 'https://v26-web.douyinvod.com/abc/video/tos/cn/tos-cn-ve-2774/xyz/?a=1')
+  assert.equal(mixed.source.kind, 'direct')
+  // play_count 恒 0 的搜索结果：当作「未知」而不是「没人看」
+  assert.equal(mixed.viewCount, undefined)
+
+  // 只剩静态资源 → 标 images/missing，canDownload 会拦掉
+  const imagesOnly = douyinRow({
+    aweme_id: '4',
+    images: [{ url_list: ['https://p3/cdn/a.jpeg'] }],
+    video: { play_addr: { url_list: ['https://sf26-sign.douyinstatic.com/obj/cover.jpeg'] } },
+  })
+  assert.equal(imagesOnly.source.url, '')
+  assert.equal(imagesOnly.source.kind, 'images')
+  const missingOnly = douyinRow({
+    aweme_id: '5',
+    video: { play_addr: { url_list: ['https://sf26-sign.douyinstatic.com/obj/cover.jpeg'] } },
+  })
+  assert.equal(missingOnly.source.kind, 'missing')
+  assert.equal(createDouyinAdapter().canDownload(missingOnly), false)
 })
 
 test('douyin helpers: file name, page cursor, creator id', () => {
@@ -807,4 +843,13 @@ test('douyin extractor walks nested containers without inventing items', () => {
   const found = douyinExtractAwemes({ data: [{ aweme_info: { aweme_id: '1', video: {} } }, { card: { aweme_id: '2', images: [] } }] })
   assert.deepEqual(found.map((x) => x.aweme_id), ['1', '2'])
   assert.deepEqual(douyinExtractAwemes({ data: [{ author: { nickname: 'x' } }] }), [])
+})
+test('refererFor picks the right anti-hotlink referer per CDN host', () => {
+  // 曾经写死成快手，抖音直链一律 403
+  assert.equal(refererFor('https://v26-web.douyinvod.com/x/video/tos/a.mp4'), 'https://www.douyin.com/')
+  assert.equal(refererFor('https://upos-sz-mirror08c.bilivideo.com/a.m4s'), 'https://www.bilibili.com/')
+  assert.equal(refererFor('https://alimov2.a.kwimgs.com/a.mp4'), 'https://www.kuaishou.com/')
+  assert.equal(refererFor('https://v1.kwaicdn.com/a.mp4'), 'https://www.kuaishou.com/')
+  assert.equal(refererFor('https://example.com/a.mp4'), '')
+  assert.equal(refererFor('not a url'), '')
 })

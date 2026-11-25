@@ -43,15 +43,15 @@ export function createKuaishouAdapter() {
       return join(stateDir, 'kuaishou', 'profile')
     },
 
-    async openSession({ stateDir, log = () => {}, signal }) {
-      return openKuaishouSession({ profileDir: join(stateDir, 'kuaishou', 'profile'), log, signal })
+    async openSession({ stateDir, log = () => {}, signal, blockMedia = false }) {
+      return openKuaishouSession({ profileDir: join(stateDir, 'kuaishou', 'profile'), log, signal, blockMedia })
     },
 
     /**
      * 登录保障：未登录就截二维码等人工扫码，最长 3 分钟。
      * onNeedHuman 由 crawl 传入，用来把 job 置成 waiting_login（含截图路径）。
      */
-    async ensureLogin(session, { stateDir, jobId, log = () => {}, signal, onNeedHuman = () => {} }) {
+    async ensureLogin(session, { stateDir, jobId, log = () => {}, signal, onNeedHuman = () => {}, waitMs = 180000 }) {
       if (!session) return { ok: true }
       if (await session.hasLogin()) return { ok: true }
       const qr = join(stateDir, 'kuaishou', `login-${jobId}.png`)
@@ -65,13 +65,14 @@ export function createKuaishouAdapter() {
       await sleep(2500)
       const saved = await session.screenshot(qr)
       if (saved) log(`已截登录二维码：${saved}`)
-      const deadline = Date.now() + 180000
+      const budget = Math.max(30000, Number(waitMs) || 180000)
+      const deadline = Date.now() + budget
       while (Date.now() < deadline) {
         if (signal?.aborted) return { ok: false, reason: 'canceled', message: '已取消' }
         await sleep(3000)
         if (await session.hasLogin()) return { ok: true }
       }
-      return { ok: false, reason: 'login', message: '等待扫码登录超时（3 分钟）' }
+      return { ok: false, reason: 'login', message: `等待扫码登录超时（${Math.round(budget / 1000)} 秒）` }
     },
 
     /** 关键词搜索：cursor 就是接口的 pcursor，空串表示第一页。 */

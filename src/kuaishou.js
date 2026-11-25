@@ -177,7 +177,7 @@ function findBrowser() {
  * 打开一个快手会话：有头浏览器 + 持久 profile（扫码一次长期有效，
  * 安全 cookie 的轮换由浏览器自己跟随）+ CDP。
  */
-export async function openKuaishouSession({ profileDir, log = () => {}, signal, port = 9415 } = {}) {
+export async function openKuaishouSession({ profileDir, log = () => {}, signal, port = 9415, blockMedia = false } = {}) {
   const bin = findBrowser()
   if (!bin) throw Object.assign(new Error('没有找到 Edge/Chrome，无法走浏览器通道'), { code: 'browser_missing' })
   mkdirSync(profileDir, { recursive: true })
@@ -244,6 +244,12 @@ export async function openKuaishouSession({ profileDir, log = () => {}, signal, 
     const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true })
     await send('Page.enable', {}, sessionId)
     await send('Network.enable', {}, sessionId)
+    // 省带宽：搜索只依赖接口 JSON，图片/视频/字体都不需要。默认关（设置页可开）。
+    if (blockMedia) {
+      await send('Network.setBlockedURLs', {
+        urls: ['*.png', '*.jpg', '*.jpeg', '*.webp', '*.gif', '*.svg', '*.mp4', '*.m3u8', '*.woff', '*.woff2', '*.ttf'],
+      }, sessionId)
+    }
     await send('Page.addScriptToEvaluateOnNewDocument', { source: KS_CAPTURE_SCRIPT }, sessionId)
 
     const evalP = async (expression) => {

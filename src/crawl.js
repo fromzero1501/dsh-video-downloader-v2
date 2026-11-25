@@ -276,10 +276,36 @@ async function mergeHlsToMp4(playlistFile, mp4File, sourceUrl, { signal, ffmpeg 
  * 下载一条直链到文件，失败时按 backupUrl 逐个重试；落盘是播放列表就合并成 mp4。
  * stallMs：连续多久没数据算卡死（断开重连）；totalMs：单条总预算。
  */
+/**
+ * 直链 CDN 的防盗链 referer：按主机猜，猜不到就不带。
+ * 这里曾经写死成快手，结果抖音直链一律 403（实测 3 条全 403）。
+ */
+export function refererFor(url) {
+  let host = ''
+  try {
+    host = new URL(String(url)).hostname
+  } catch {
+    return ''
+  }
+  if (/douyin|douyinvod|douyinstatic|iesdouyin/.test(host)) return 'https://www.douyin.com/'
+  if (/bilibili|bilivideo|hdslb|b23\.tv/.test(host)) return 'https://www.bilibili.com/'
+  if (/kuaishou|kwai|kwimgs|yximgs|kspkg|chenzhongtech|gifshow/.test(host)) return 'https://www.kuaishou.com/'
+  return ''
+}
+
 async function downloadDirect(url, file, {
-  signal, backupUrls = [], ffmpeg, stallMs = DOWNLOAD_STALL_MS, totalMs = DOWNLOAD_TOTAL_MS,
+  signal, backupUrls = [], ffmpeg, stallMs = DOWNLOAD_STALL_MS, totalMs = DOWNLOAD_TOTAL_MS, headers = {},
 } = {}) {
-  const headers = { 'user-agent': UA, referer: 'https://www.kuaishou.com/', accept: '*/*' }
+  // referer 必须按目标主机的算：备用地址可能落在另一个 CDN 域上。
+  const headersFor = (target) => {
+    const ref = refererFor(target)
+    return {
+      'user-agent': UA,
+      accept: '*/*',
+      ...(ref ? { referer: ref } : {}),
+      ...headers,
+    }
+  }
   const once = async (target) => {
     const ctrl = new AbortController()
     let last = Date.now()
@@ -295,8 +321,14 @@ async function downloadDirect(url, file, {
       ? setTimeout(() => ctrl.abort(new Error(`单条超过 ${Math.round(totalMs / 1000)} 秒，放弃`)), totalMs)
       : null
     try {
-      const res = await fetch(target, { headers, signal: ctrl.signal, redirect: 'follow' })
+      const res = await fetch(target, { headers: headersFor(target), signal: ctrl.signal, redirect: 'follow' })
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+      // 类型闸门：拿到的不是视频就别存成 .mp4（踩过：把封面图存成了 mp4）。
+      // mpegurl / text-plain 要放行——HLS-only 作品先落成播放列表，再由 readHead 认出 #EXTM3U 交给 ffmpeg 合并。
+      const ctype = String(res.headers.get('content-type') || '').toLowerCase()
+      if (ctype && !/^video\/|octet-stream|mpegurl|^text\/plain/.test(ctype)) {
+        throw new Error(`返回的不是视频（content-type: ${ctype}）`)
+      }
       const expect = Number(res.headers.get('content-length') || 0)
       const ws = createWriteStream(file)
       let bytes = 0
@@ -351,6 +383,16 @@ class PauseSignal extends Error {
  * 平台差异全部下放在 adapter 里（见 src/platforms/）。这里只管：
  * 关键词/作者两条入口、筛选、去重索引、并发 6、停滞重连、HLS 回落、分环节计时。
  */
+export const CRAWL_TUNING_DEFAULTS = {
+  concurrency: 6,        // 下载并发；平台自己的 maxConcurrency 会再压一道
+  pageDelayMs: 1500,     // 翻页间隔基准，实际是 基准 + 0..1000ms 抖动
+  keywordGapMs: 800,     // 换关键词前的停顿，抖动 ±35%
+  loginWaitMs: 180000,   // 等扫码登录的上限
+  stallMs: DOWNLOAD_STALL_MS,
+  totalMs: DOWNLOAD_TOTAL_MS,
+  blockMedia: false,     // 屏蔽图片/视频/字体请求（抖音开了会拿不到数据，默认关）
+}
+
 export function createCrawler({
   stateDir,
   defaultRoot,
@@ -359,8 +401,17 @@ export function createCrawler({
   log = () => {},
   ffmpeg = null,
   adapters = null,
+  tuning = {},
 }) {
   const defaultPlatform = String(platform || 'kuaishou').toLowerCase()
+  // 采集节奏：设置页能改的所有旋钮都收在这里，job 级传参会覆盖它。
+  const T = { ...CRAWL_TUNING_DEFAULTS }
+  for (const [k, v] of Object.entries(tuning || {})) {
+    if (v === undefined || v === null || v === '') continue
+    if (k === 'blockMedia') { T.blockMedia = Boolean(v); continue }
+    const n = Number(v)
+    if (Number.isFinite(n)) T[k] = n
+  }
   const adapterOf = (id) => {
     const key = String(id || defaultPlatform).toLowerCase()
     const found = adapters?.get?.(key)
@@ -481,8 +532,15 @@ export function createCrawler({
     }
 
     const pageDelay = () => {
-      const minDelay = Number(process.env.DSH_KS_PAGE_DELAY_MS) || 1500
-      return minDelay + Math.floor(Math.random() * 1500)
+      const base = Number(process.env.DSH_KS_PAGE_DELAY_MS) || T.pageDelayMs || 1500
+      return base + Math.floor(Math.random() * 1000)
+    }
+    // 换关键词之间也要停一下：实测同一关键词连打必被限流，换词不停顿同样会累计风控。
+    const keywordGap = async () => {
+      const base = Math.max(0, Number(T.keywordGapMs) || 0)
+      if (!base) return
+      const jitter = base * (Math.random() * 0.7 - 0.35)
+      await sleep(Math.round(base + jitter))
     }
 
     // 作者主页入口：没有词表，一条游标翻到底
@@ -548,13 +606,17 @@ export function createCrawler({
         log(`「${word}」第 ${pages + 1} 页拿到 ${counted.rows} 条，可用 ${job.found.length} 条（筛掉 ${job.stats.filtered}）`)
 
         if (fresh >= job.limit) return true
-        sessionId = res.nextSessionId || sessionId
+        sessionId = res.searchSessionId || res.nextSessionId || sessionId
         const next = res.nextCursor || ''
         if (!next || visited.has(next)) break
         visited.add(next)
         pcursor = next
         pages += 1
         await sleep(pageDelay())
+      }
+      // 还有下一个词、且额度没凑够，才停顿；已经是最后一个词就直接收工。
+      if (wi < words.length - 1 && fresh < job.limit) {
+        await keywordGap()
       }
     }
     return fresh >= job.limit
@@ -568,8 +630,8 @@ export function createCrawler({
     const searchDone = typeof ctx.searchDone === 'function' ? ctx.searchDone : () => true
     const adapter = adapterOf(job.platform)
     const index = loadCrawlIndex(indexFile)
-    // 并发上限取两头：用户的（默认 6，clamp 1–8）和平台自己的（B站 2，撞风控划不来）。
-    const want = Math.max(1, Math.min(8, Number(job.concurrency) || 6))
+    // 并发上限取两头：用户的（默认取设置页/内置的 6，clamp 1–8）和平台自己的（B站 2，撞风控划不来）。
+    const want = Math.max(1, Math.min(8, Number(job.concurrency) || T.concurrency || 6))
     const cap = Number(adapter?.maxConcurrency) > 0 ? Number(adapter.maxConcurrency) : 8
     const concurrency = Math.max(1, Math.min(want, cap))
     let cursor = 0
@@ -612,6 +674,8 @@ export function createCrawler({
             ? await adapter.download(row, { file, dir: job.dir, signal, ffmpeg })
             : await downloadDirect(row.source.url, file, {
               signal, backupUrls: row.source.backupUrl, ffmpeg,
+              stallMs: T.stallMs, totalMs: T.totalMs,
+              headers: adapter.downloadHeaders?.(row) || {},
             })
           const bytes = typeof res === 'object' && res !== null ? Number(res.bytes) || 0 : Number(res) || 0
           const savedFile = typeof res === 'object' && res !== null && res.savedTo ? res.savedTo : file
@@ -665,7 +729,7 @@ export function createCrawler({
       job.startedAt = new Date().toISOString()
       setStatus(job, 'searching')
       const adapter = adapterOf(job.platform)
-      session = await adapter.openSession({ stateDir, log, signal })
+      session = await adapter.openSession({ stateDir, log, signal, blockMedia: T.blockMedia })
 
       // 登录保障交给平台自己：快手要扫码，B站匿名也能搜。需要人工时由 onNeedHuman 落 waiting_login。
       const login = await adapter.ensureLogin(session, {
@@ -673,6 +737,7 @@ export function createCrawler({
         jobId: job.id,
         log,
         signal,
+        waitMs: T.loginWaitMs,
         onNeedHuman: (info) => setStatus(job, 'waiting_login', { needHuman: info }),
       })
       if (!login.ok) {
@@ -788,6 +853,11 @@ export function createCrawler({
         filterNotes.push(`该入口不返回点赞量，最低点赞 ${filters.minLike} 已忽略`)
         filters.minLike = 0
       }
+      // 播放量同理：抖音搜索结果不带 play_count、B站作者入口也没有，硬筛会把整批筛空。
+      if (adapter.supportsViewFilter && !adapter.supportsViewFilter(source) && filters.minView > 0) {
+        filterNotes.push(`该入口不返回播放量，最低播放 ${filters.minView} 已忽略`)
+        filters.minView = 0
+      }
       const job = {
         id: newJobId(platformKey),
         platform: platformKey,
@@ -800,7 +870,7 @@ export function createCrawler({
         dir,
         limit,
         maxPages,
-        concurrency: Number(opts.concurrency) > 0 ? Math.max(1, Math.min(8, Math.floor(Number(opts.concurrency)))) : 6,
+        concurrency: Number(opts.concurrency) > 0 ? Math.max(1, Math.min(8, Math.floor(Number(opts.concurrency)))) : (T.concurrency || 6),
         filters,
         filterNotes,
         status: 'queued',

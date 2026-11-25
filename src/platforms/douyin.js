@@ -124,8 +124,18 @@ export function douyinRow(aweme, { source = 'search' } = {}) {
   const video = aweme.video || {}
   const play = video.play_addr || {}
   const urls = Array.isArray(play.url_list) ? play.url_list.filter(Boolean).map(String) : []
+  // play_addr 里会混进音乐/封面等静态资源（douyinstatic 的 obj/ies-m、tos-cn-ve-*），
+  // 照着下会存出一个不是视频的文件——实测踩过，所以只认真正的视频 CDN。
+  const isVideoUrl = (u) =>
+    /douyinvod\.com\//i.test(u) || /\/video\/tos\//i.test(u) || /\.mp4(\?|#|$)/i.test(u)
+  const videoUrls = urls.filter(isVideoUrl)
+  const images = Array.isArray(aweme.images) ? aweme.images.filter(Boolean) : []
   const stat = aweme.statistics || {}
   const num = (v) => (v === undefined || v === null || v === '' ? undefined : Number(v))
+  const pos = (v) => {
+    const n = num(v)
+    return Number.isFinite(n) && n > 0 ? n : undefined
+  }
   const created = num(aweme.create_time)
   return {
     id,
@@ -134,11 +144,16 @@ export function douyinRow(aweme, { source = 'search' } = {}) {
     authorId: String((aweme.author || {}).sec_uid || '').trim(),
     // 搜索与作者作品都带 statistics.digg_count；拿不到就保持 undefined，绝不补 0
     likeCount: num(stat.digg_count),
-    viewCount: num(stat.play_count),
+    // 搜索结果实测恒为 play_count=0（接口不给播放量），0 当「未知」而不是「没人看」
+    viewCount: pos(stat.play_count),
     commentCount: num(stat.comment_count),
     timestampMs: created ? created * 1000 : undefined,
     durationMs: num(video.duration),
-    source: { url: urls[0] || '', backupUrl: urls.slice(1), kind: urls.length ? 'direct' : 'missing' },
+    source: {
+      url: videoUrls[0] || '',
+      backupUrl: videoUrls.slice(1),
+      kind: videoUrls.length ? 'direct' : images.length ? 'images' : 'missing',
+    },
     rawSource: source,
   }
 }
@@ -174,7 +189,7 @@ function findBrowser() {
  * 打开抖音会话：有头浏览器 + 持久 profile（扫码一次长期有效）+ CDP。
  * 页面内 fetch 由抖音自己的运行时补签，所以这里不需要注入任何签名钩子。
  */
-export async function openDouyinSession({ profileDir, log = () => {}, signal, port = 9417 } = {}) {
+export async function openDouyinSession({ profileDir, log = () => {}, signal, port = 9417, blockMedia = false } = {}) {
   const bin = findBrowser()
   if (!bin) throw Object.assign(new Error('没有找到 Edge/Chrome，无法走浏览器通道'), { code: 'browser_missing' })
   mkdirSync(profileDir, { recursive: true })
@@ -239,6 +254,12 @@ export async function openDouyinSession({ profileDir, log = () => {}, signal, po
     const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true })
     await send('Page.enable', {}, sessionId)
     await send('Network.enable', {}, sessionId)
+    // 注意：抖音是 SPA，屏蔽图片/视频请求会打断首屏渲染、导致拿不到数据，所以这里默认关。
+    if (blockMedia) {
+      await send('Network.setBlockedURLs', {
+        urls: ['*.png', '*.jpg', '*.jpeg', '*.webp', '*.gif', '*.woff', '*.woff2', '*.ttf'],
+      }, sessionId)
+    }
 
     const evalP = async (expression) => {
       const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId)
@@ -409,24 +430,25 @@ export function createDouyinAdapter() {
     supportsLikeFilter: () => true,
     profileDir: (stateDir) => `${stateDir}/douyin/profile`,
 
-    async openSession({ stateDir, log, signal } = {}) {
-      return openDouyinSession({ profileDir: `${stateDir}/douyin/profile`, log, signal })
+    async openSession({ stateDir, log, signal, blockMedia = false } = {}) {
+      return openDouyinSession({ profileDir: `${stateDir}/douyin/profile`, log, signal, blockMedia })
     },
 
     /** 没有登录态就没法搜索（接口直接回 2483），所以这里必须等用户扫码。 */
-    async ensureLogin(session, { stateDir, jobId, log = () => {}, signal, onNeedHuman } = {}) {
+    async ensureLogin(session, { stateDir, jobId, log = () => {}, signal, onNeedHuman, waitMs = 180000 } = {}) {
       if (await session.hasLogin()) return { ok: true, loggedIn: true }
       const shot = `${stateDir}/douyin-${jobId || 'login'}.png`
       log('抖音未登录：需要扫码（搜索接口未登录直接拒绝）')
       try { await session.screenshot(shot) } catch {}
       try { onNeedHuman?.({ reason: 'login', message: '抖音需要扫码登录', screenshot: shot }) } catch {}
-      const deadline = Date.now() + 180000
+      const budget = Math.max(30000, Number(waitMs) || 180000)
+      const deadline = Date.now() + budget
       while (Date.now() < deadline) {
         if (signal?.aborted) return { ok: false, reason: 'canceled', message: '已取消' }
         await sleep(3000)
         if (await session.hasLogin()) { log('抖音登录态已就绪'); return { ok: true, loggedIn: true } }
       }
-      return { ok: false, reason: 'need_login', message: '抖音登录超时（3 分钟）：请在弹出的浏览器里扫码后 resume', screenshot: shot }
+      return { ok: false, reason: 'need_login', message: `抖音登录超时（${Math.round(budget / 1000)} 秒）：请在弹出的浏览器里扫码后 resume`, screenshot: shot }
     },
 
     async searchKeyword(session, { keyword, cursor = '', sessionId = '' } = {}) {
@@ -454,6 +476,11 @@ export function createDouyinAdapter() {
 
     canDownload(row) {
       return Boolean(row?.source?.url)
+    },
+
+    // 抖音搜索接口不给播放量（play_count 恒 0），按播放量筛只会把整批筛空 → 声明不支持
+    supportsViewFilter() {
+      return false
     },
 
     fileName(row) {

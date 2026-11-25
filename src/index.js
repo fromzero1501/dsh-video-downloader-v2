@@ -73,6 +73,41 @@ export const Config = !z
         .default('kuaishou')
         .description('关键词/作者批量爬取的默认平台：kuaishou（快手）/ bilibili（B站）/ douyin（抖音）')
         .extra('volatile', true),
+      crawlConcurrency: z
+        .string()
+        .default('')
+        .description('下载并发（留空 = 6；实测 6 最快，8 反而回落；B站 各自夹到 2）')
+        .extra('volatile', true),
+      crawlPageDelayMs: z
+        .string()
+        .default('')
+        .description('翻页间隔基准毫秒（留空 = 1500，实际再加 0–1000ms 抖动；调小容易撞风控）')
+        .extra('volatile', true),
+      crawlKeywordGapMs: z
+        .string()
+        .default('')
+        .description('换关键词之间的停顿毫秒（留空 = 800，抖动 ±35%）')
+        .extra('volatile', true),
+      crawlLoginWaitSec: z
+        .string()
+        .default('')
+        .description('等待扫码登录的秒数（留空 = 180）')
+        .extra('volatile', true),
+      crawlStallSec: z
+        .string()
+        .default('')
+        .description('单条下载连续多少秒没有数据就断开重连（留空 = 15）')
+        .extra('volatile', true),
+      crawlDownloadTimeoutSec: z
+        .string()
+        .default('')
+        .description('单条下载的总时间预算秒数（留空 = 300）')
+        .extra('volatile', true),
+      crawlBlockMedia: z
+        .boolean()
+        .default(false)
+        .description('搜索时屏蔽图片/视频/字体请求以省带宽（抖音开了会拿不到数据，默认关）')
+        .extra('volatile', true),
       defaultQuality: z
         .string()
         .default('best')
@@ -130,6 +165,13 @@ const CONFIG_KEYS = {
   crawlMinLike: 'string',
   crawlMinView: 'string',
   crawlPlatform: 'string',
+  crawlConcurrency: 'string',
+  crawlPageDelayMs: 'string',
+  crawlKeywordGapMs: 'string',
+  crawlLoginWaitSec: 'string',
+  crawlStallSec: 'string',
+  crawlDownloadTimeoutSec: 'string',
+  crawlBlockMedia: 'boolean',
   defaultQuality: 'string',
   biliUseCredential: 'boolean',
   biliCredentialPath: 'string',
@@ -148,6 +190,13 @@ const CONFIG_DEFAULTS = {
   crawlMinLike: '',
   crawlMinView: '',
   crawlPlatform: 'kuaishou',
+  crawlConcurrency: '',
+  crawlPageDelayMs: '',
+  crawlKeywordGapMs: '',
+  crawlLoginWaitSec: '',
+  crawlStallSec: '',
+  crawlDownloadTimeoutSec: '',
+  crawlBlockMedia: false,
   defaultQuality: 'best',
   biliUseCredential: true,
   biliCredentialPath: '',
@@ -2356,6 +2405,7 @@ async function settingsSnapshot({ probe = false } = {}) {
     downloadDir: defaultDownloadDir(),
     crawlRoot: defaultCrawlRoot(),
     crawlFilters: normalizeCrawlFilters(currentCrawlFilters()),
+    crawlTuning: crawlTuning(),
     credential: found,
     loggedIn: null,
   }
@@ -2406,6 +2456,14 @@ function applySettingsPatch(patch) {
         const n = Number(text)
         if (!Number.isFinite(n) || n < 0) throw new Error(`${key} 需要一个 ≥ 0 的数字`)
         warnings.push(`${key} = ${n}（0 表示不限）`)
+      }
+      // 采集节奏：都是「留空 = 内置默认」，所以只校验非空的那些。
+      if (['crawlConcurrency', 'crawlPageDelayMs', 'crawlKeywordGapMs', 'crawlLoginWaitSec', 'crawlStallSec', 'crawlDownloadTimeoutSec'].includes(key) && text) {
+        const n = Number(text)
+        if (!Number.isFinite(n) || n <= 0) throw new Error(`${key} 需要一个 > 0 的数字（留空 = 用内置默认）`)
+        if (key === 'crawlConcurrency' && n > 8) throw new Error('crawlConcurrency 最大 8（实测 8 已经开始回落）')
+        if (key === 'crawlPageDelayMs' && n < 300) throw new Error('crawlPageDelayMs 不要低于 300 毫秒，会被风控')
+        if (key === 'crawlLoginWaitSec' && n < 30) throw new Error('crawlLoginWaitSec 不要低于 30 秒')
       }
     }
   }
@@ -2554,6 +2612,32 @@ const OUTPUT = { schema: { type: 'string' }, render: renderText }
 // ---------------------------------------------------------------- 关键词爬取
 
 let crawlerInstance = null
+let crawlerKey = ''
+
+/**
+ * 采集节奏旋钮（设置页可改）。留空 = 交给 createCrawler 的内置默认，
+ * 所以这里只在真的填了值时才出现键，避免把默认值固化进缓存键。
+ */
+function crawlTuning() {
+  const num = (k) => {
+    const v = panelStr(k)
+    const n = Number(v)
+    return v && Number.isFinite(n) && n > 0 ? n : undefined
+  }
+  const sec = (k) => {
+    const n = num(k)
+    return n === undefined ? undefined : Math.round(n * 1000)
+  }
+  return {
+    concurrency: num('crawlConcurrency'),
+    pageDelayMs: num('crawlPageDelayMs'),
+    keywordGapMs: num('crawlKeywordGapMs'),
+    loginWaitMs: sec('crawlLoginWaitSec'),
+    stallMs: sec('crawlStallSec'),
+    totalMs: sec('crawlDownloadTimeoutSec'),
+    blockMedia: panelBool('crawlBlockMedia', false),
+  }
+}
 
 /** 设置页里的三个筛选值，空串表示不限。 */
 function currentCrawlFilters() {
@@ -2580,15 +2664,20 @@ function registryOf() {
 
 /** 爬取管理器单例（浏览器 profile、任务状态目录都在 stateDir 下）。 */
 function crawlerOf() {
-  if (!crawlerInstance) {
+  const tuning = crawlTuning()
+  const key = JSON.stringify(tuning)
+  // 设置页改完要能立刻生效，所以节奏值一变就重建（索引与任务文件都在盘上，重建不丢东西）。
+  if (!crawlerInstance || crawlerKey !== key) {
     crawlerInstance = createCrawler({
       stateDir: stateDirOf(),
       defaultRoot: defaultCrawlRoot(),
       platform: panelStr('crawlPlatform') || 'kuaishou',
       adapters: registryOf(),
+      tuning,
       // 快手偶尔只给 HLS 播放列表、B站 DASH 音视频分离，落盘后要用 ffmpeg 合并；惰性求值，缺 ffmpeg 时那条记失败而不是整任务崩
       ffmpeg: () => findFfmpeg(),
     })
+    crawlerKey = key
   }
   return crawlerInstance
 }

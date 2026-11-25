@@ -178,7 +178,10 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - **必须登录**：未登录直接回 `status_code: 2483 请先登录`。首次跑会自动打开浏览器请你扫码，`needHuman` 带提示与截图，确认后任务自动继续（最多等 3 分钟）；登录态存在 `<DSH_HOME>\video-downloader\douyin\profile`，后续复用。
 - 错误分流：`8` / `2483` 或文案含「未登录」→ `need_login`；文案或 `search_nil_info` 含 `verify` / `captcha` / `risk` → `captcha`（暂停等人工）；`2154` / `10000` → `rate_limited`；其余非 0 码 → `blocked`。
 - 下载：`video.play_addr.url_list` 是 CDN 直链，走内置 `downloadDirect`（不转码、不合并），首个候选失败自动换 `backupUrl`。
+- **`url_list` 里会混进封面和音乐**（`douyinstatic.com` 的 `obj/…`、`tomusic` 之类）。实测有用 `url_list[0]` 直接下、结果存出一个不是视频的文件；所以只认真正的视频 CDN（`douyinvod.com`、路径含 `/video/tos/`、或扩展名 `.mp4`），其余丢弃。剩下只有静态资源时标 `source.kind = 'images'`（有图集）或 `'missing'`，`canDownload` 返回 false，记 `noSource` 不下载。
+- **播放量筛不了**：搜索结果里 `statistics.play_count` 实测恒为 `0`（接口不给播放量）。`0` 按「未知」处理而不是「没人看」，并声明 `supportsViewFilter() === false`——设了「最低播放量」时会自动清零并在任务的 `filterNotes` 里说明，否则会把整批筛空。
 - 图集作品（只有 `images`、没有 `video`）不下载，记 `noSource`。
+- 兜底闸门：`downloadDirect` 落盘前看 `content-type`，不是 `video/*`（放行 `octet-stream` 与 HLS 的 `mpegurl`/`text-plain`）就直接判失败，不会把 HTML 错误页或封面图存成 `.mp4`。
 
 ### 各平台对照
 
@@ -189,6 +192,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | 关键词分页 | `pcursor` | 页码 `page` | `offset` |
 | 作者主页 | `/rest/v/profile/feed` | `/x/space/wbi/arc/search` | `/aweme/v1/web/aweme/post/` |
 | 点赞筛选 | 有效 | 仅关键词入口有效 | 两个入口都有效 |
+| 播放量筛选 | 有效 | 有效 | **无效**（接口不给 `play_count`，设了会自动忽略并记 `filterNotes`） |
 | 下载 | 单文件 mp4 直链（HLS 才借 ffmpeg） | DASH 分离，需 ffmpeg | CDN 直链，不需 ffmpeg |
 | 并发上限 | 6 | 2 | 3 |
 
@@ -221,7 +225,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 **设置 → 左侧栏「视频下载」**（与「刷B站」同级的那一页）。改完点保存即生效，不用重启；留空 = 没设（退回下一层），所以清空设置页不会让插件失效。
 
-页面顶部是一条吸顶状态带：ffmpeg / yt-dlp / lux 是否就绪、B站 登录态、还有几项改动没保存，右侧是「保存 / 重新读取」。下面按用途分成可折叠的分区（下载落点与清晰度、批量爬取、账号、后端与代理、外部组件路径），**分区标题右侧直接显示这一项现在其实是什么**——默认状态下一屏就能看完所有当前生效值，想改再展开。
+页面顶部是一条吸顶状态带：ffmpeg / yt-dlp / lux 是否就绪、B站 登录态、还有几项改动没保存，右侧是「保存 / 重新读取」。下面按用途分成可折叠的分区（下载落点与清晰度、批量爬取、采集节奏与超时、账号、后端与代理、外部组件路径），**分区标题右侧直接显示这一项现在其实是什么**——默认状态下一屏就能看完所有当前生效值，想改再展开。`采集节奏与超时` 默认收起：它是排障与调参用的，正常使用不用碰。
 
 | 设置项 | 默认 | 说明 |
 | --- | --- | --- |
@@ -238,7 +242,14 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | 批量爬取默认平台 | `kuaishou` | 只影响没显式传 `platform` 时的默认值；传了链接或 `platform` 参数以调用为准 |
 | 最近 N 天 | 空 | 空或 0 = 不限；只下载发布时间在最近 N 天内的（没有发布时间的数据在设了这个条件时算不合格） |
 | 最低点赞 | 空 | 空或 0 = 不限；快手的「喜欢」就是点赞 |
-| 最低播放量 | 空 | 空或 0 = 不限 |
+| 最低播放量 | 空 | 空或 0 = 不限；抖音搜索没有播放量，设了会被自动忽略并记进 `filterNotes` |
+| 下载并发 | 空 = 6 | 实测 6 最快（36.7MB/s），8 反而回落到 30.7；上限 8。B站 自己夹到 2 |
+| 翻页间隔（毫秒） | 空 = 1500 | 实际再加 0–1000ms 抖动；低于 300 会被风控 |
+| 换关键词停顿（毫秒） | 空 = 800 | 抖动 ±35%；同一个词翻到底换下一个词前停一下，设 0 会累计风控 |
+| 等扫码登录（秒） | 空 = 180 | 抖音/快手首次要扫码；超时后任务转 `paused_need_human`，扫码完 `video_crawl_resume` 续跑 |
+| 停滞断开重连（秒） | 空 = 15 | 连续这么久没数据就断开重连；**别按体积估超时**，1MB/s 的慢连接 78MB 也能正常下完 |
+| 单条下载总预算（秒） | 空 = 300 | 超过就放弃并记 failed，不拖住整批 |
+| 搜索时屏蔽图片/视频/字体 | 关 | 省带宽，但抖音是 SPA，开了会拿不到数据——只在纯快手任务里才建议开 |
 
 优先级：**单次工具调用的显式传参 > 设置页 > 环境变量 > 内置默认**。环境变量（`DSH_VIDEO_DOWNLOAD_DIR` / `DSH_BILI_CREDENTIAL` / `DSH_FFMPEG_PATH` / `DSH_YTDLP_PATH` / `DSH_YTDLP_PROXY` / `DSH_LUX_PATH` / `DSH_LUX_PROXY` / `DSH_GENERIC_BACKEND` / `DSH_CRAWL_ROOT` / `DSH_KS_PAGE_DELAY_MS`）仍可用，但设置页里填了就以设置页为准。
 

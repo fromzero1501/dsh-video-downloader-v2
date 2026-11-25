@@ -237,6 +237,15 @@ window.__ModuleLoader__.load({
         filters.minLike > 0 ? '点赞 ≥ ' + filters.minLike : '不限点赞',
         filters.minView > 0 ? '播放 ≥ ' + filters.minView : '不限播放',
       ].join(' · ')
+      // crawlTuning 里只有「用户真的填了值」的键才出现，其余交给内置默认，所以这里用默认值兜底显示。
+      const tuning = st.crawlTuning || {}
+      const ms = (v, d) => (Number(v) > 0 ? Number(v) : d)
+      const tunText = [
+        '并发 ' + ms(form.crawlConcurrency || tuning.concurrency, 6),
+        '页间隔 ' + (ms(form.crawlPageDelayMs || tuning.pageDelayMs, 1500) / 1000).toFixed(1) + 's',
+        '换词间隙 ' + (ms(form.crawlKeywordGapMs || tuning.keywordGapMs, 800) / 1000).toFixed(1) + 's',
+        form.crawlBlockMedia ? '屏蔽媒体' : '不屏蔽媒体',
+      ].join(' · ')
 
       return h('div', { 'data-vd-page': '' },
 
@@ -305,6 +314,65 @@ window.__ModuleLoader__.load({
               h('div', { 'data-vd-label': '' }, label),
               h(TextInput, { placeholder: ph, value: form[key], onChange: (v) => setKey(key, v) }),
               h('div', { 'data-vd-note': '' }, note))))),
+
+        // 进阶：默认收起。这里的值都能被 video_crawl 的单次传参覆盖。
+        h(Section, { title: '采集节奏与超时', open: false, sum: tunText },
+          h('div', { 'data-vd-hint': '' }, '留空 = 用内置默认值（括号里那个）。这些值决定「会不会被风控」和「一条卡住要等多久」，改之前先看右边说明。'),
+          h(TextField, {
+            label: '下载并发',
+            note: '留空 = 6（实测 6 最快：6→36.7MB/s，8 反而掉到 30.7）；B站 自己会夹到 2',
+            placeholder: String(tuning.concurrency || 6),
+            value: form.crawlConcurrency,
+            source: srcText('crawlConcurrency'),
+            onChange: (v) => setKey('crawlConcurrency', v),
+          }),
+          h(TextField, {
+            label: '翻页间隔（毫秒）',
+            note: '留空 = 1500，实际再加 0–1000ms 随机抖动。低于 300 会被风控',
+            placeholder: String(tuning.pageDelayMs || 1500),
+            value: form.crawlPageDelayMs,
+            source: srcText('crawlPageDelayMs'),
+            onChange: (v) => setKey('crawlPageDelayMs', v),
+          }),
+          h(TextField, {
+            label: '换关键词停顿（毫秒）',
+            note: '留空 = 800（抖动 ±35%）。同一个词翻到底再换词前停一下，等于 0 会累计风控',
+            placeholder: String(tuning.keywordGapMs || 800),
+            value: form.crawlKeywordGapMs,
+            source: srcText('crawlKeywordGapMs'),
+            onChange: (v) => setKey('crawlKeywordGapMs', v),
+          }),
+          h(TextField, {
+            label: '等扫码登录（秒）',
+            note: '留空 = 180。抖音/快手首次要扫码，超时后任务转为「等你处理」，可以 resume 续跑',
+            placeholder: String(Math.round((tuning.loginWaitMs || 180000) / 1000)),
+            value: form.crawlLoginWaitSec,
+            source: srcText('crawlLoginWaitSec'),
+            onChange: (v) => setKey('crawlLoginWaitSec', v),
+          }),
+          h(TextField, {
+            label: '停滞多久断开重连（秒）',
+            note: '留空 = 15。连续这么久收不到数据就断开重连，别按体积估超时（会误杀慢连接）',
+            placeholder: String(Math.round((tuning.stallMs || 15000) / 1000)),
+            value: form.crawlStallSec,
+            source: srcText('crawlStallSec'),
+            onChange: (v) => setKey('crawlStallSec', v),
+          }),
+          h(TextField, {
+            label: '单条下载总预算（秒）',
+            note: '留空 = 300。超过就放弃并记 failed，不拖住整批',
+            placeholder: String(Math.round((tuning.totalMs || 300000) / 1000)),
+            value: form.crawlDownloadTimeoutSec,
+            source: srcText('crawlDownloadTimeoutSec'),
+            onChange: (v) => setKey('crawlDownloadTimeoutSec', v),
+          }),
+          h(SwitchField, {
+            label: '搜索时屏蔽图片/视频/字体',
+            note: '省带宽，但抖音是 SPA，开了会拿不到数据——只有在纯快手任务里才建议开',
+            source: srcText('crawlBlockMedia'),
+            on: form.crawlBlockMedia === true,
+            onChange: (v) => setKey('crawlBlockMedia', v),
+          })),
 
         h(Section, { title: '账号', sum: st.credential ? 'B站 凭证已找到' : 'B站 凭证未找到（匿名 480P）' },
           h(SwitchField, {
