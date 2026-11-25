@@ -1,3 +1,5 @@
-﻿node_modules/
+node_modules/
 *.tgz
 package-lock.json
+# 改码前留的回滚副本，不进仓库
+*.bak

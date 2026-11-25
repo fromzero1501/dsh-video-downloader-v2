@@ -19,10 +19,10 @@
  * Schema, which is exactly what `ctx.tools.register()` consumes.
  */
 
-import { createWriteStream, mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs'
+import { createWriteStream, mkdirSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { existsSync, readFileSync } from 'node:fs'
 import { renameSync, unlinkSync } from 'node:fs'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { Readable } from 'node:stream'
@@ -76,6 +76,16 @@ export const Config = !z
         .default('')
         .description('yt-dlp 代理地址（只作用于非 B 站站点；B 站 一律直连）')
         .extra('volatile', true),
+      luxPath: z
+        .string()
+        .default('')
+        .description('lux 可执行文件路径；留空 = 自动探测（DSH_LUX_PATH / PATH / ~/go/bin/lux.exe）')
+        .extra('volatile', true),
+      genericBackend: z
+        .string()
+        .default('auto')
+        .description('通用后端顺序：auto（yt-dlp 优先、lux 兜底）/ ytdlp（只用 yt-dlp）/ lux（lux 优先、yt-dlp 兜底）')
+        .extra('volatile', true),
     })
 
 /** 当前面板配置：cordis 把 fiber.config 传进 apply，volatile 字段改动会就地改它。 */
@@ -94,7 +104,25 @@ const CONFIG_KEYS = {
   ffmpegPath: 'string',
   ytdlpPath: 'string',
   ytdlpProxy: 'string',
+  luxPath: 'string',
+  genericBackend: 'string',
 }
+
+/** 每项的内置默认值（设置页读不到时的兜底，必须与 Config 的 .default() 保持一致）。 */
+const CONFIG_DEFAULTS = {
+  downloadDir: '',
+  defaultQuality: 'best',
+  biliUseCredential: true,
+  biliCredentialPath: '',
+  ffmpegPath: '',
+  ytdlpPath: '',
+  ytdlpProxy: '',
+  luxPath: '',
+  genericBackend: 'auto',
+}
+
+/** genericBackend 的合法取值（校验、候选序列、设置页三处共用同一张表）。 */
+const GENERIC_BACKEND_PREFS = ['auto', 'ytdlp', 'lux']
 
 /** 本插件自己的设置文件目录：$DSH_HOME/video-downloader。 */
 function stateDirOf() {
@@ -1340,6 +1368,368 @@ export async function downloadWithYtDlp(input, { outPath, cookies, signal, quali
   }
 }
 
+// ------------------------------------------------------------------ lux backend
+// lux (github.com/iawia002/lux) 是 Go 单二进制下载器，站点表偏中文，补的正是 yt-dlp
+// 没有的那几个国内站（快手、腾讯视频、好看视频、秒拍、Threads…）。它版本停在 2024 年，
+// 站点接口一改就会失效，所以这里只当**兜底**，不做主力：
+//   · 不接 B站（内置解析更全，能带账号 cookie 取高清）
+//   · 不接抖音（lux 无法关代理，抖音直链必须直连）
+//   · 不做字幕 / 元数据 / 后处理
+// 另有一处语义差异：lux 的 `-f` 是站内自定义流 id（如 "32-12"），和 yt-dlp 的
+// formatId 不能互用，所以两者结果里都带 backend 字段，调用方别混。
+
+let luxProbe = null
+let luxProbeKey = null
+
+/**
+ * Locate lux：面板设置 → DSH_LUX_PATH → PATH → go install 落点（GOBIN / ~/go/bin）。
+ * 与 ffmpeg / yt-dlp 一样按「生效的显式路径」失效缓存，填错路径落回自动探测。
+ */
+export function findLux() {
+  const explicit = panelStr('luxPath') || (process.env.DSH_LUX_PATH || '').trim()
+  if (luxProbe !== null && luxProbeKey === explicit) return luxProbe
+  const exe = process.platform === 'win32' ? 'lux.exe' : 'lux'
+  const goBin = (process.env.GOBIN || '').trim()
+  luxProbe =
+    usableBin(explicit, ['-v'], 8000) ||
+    usableBin('lux', ['-v'], 8000) ||
+    usableBin(goBin ? join(goBin, exe) : '', ['-v'], 8000) ||
+    usableBin(join(homedir(), 'go', 'bin', exe), ['-v'], 8000)
+  luxProbeKey = explicit
+  return luxProbe
+}
+
+/**
+ * 通用后端的候选序列（纯函数）。
+ * auto  = yt-dlp 优先、lux 兜底（默认：lux 的站点维护停滞，不能让它挡在前面）
+ * ytdlp = 只用 yt-dlp
+ * lux   = lux 优先、yt-dlp 兜底
+ * 抖音一律不给 lux：lux 没有 `--proxy ""`，抖音直链走系统代理会被风控。
+ */
+export function genericBackendOrder(pref, { douyin = false } = {}) {
+  const p = String(pref == null ? 'auto' : pref).trim().toLowerCase()
+  const order = p === 'lux' ? ['lux', 'ytdlp'] : p === 'ytdlp' ? ['ytdlp'] : ['ytdlp', 'lux']
+  return douyin ? order.filter((b) => b !== 'lux') : order
+}
+
+/**
+ * 什么时候才换下一个后端：只换「这个后端根本干不了」。
+ * 站点要求登录 / 被风控 / 网络不通时不换 —— 换一个后端只是把同一段等待再付一遍。
+ */
+const BACKEND_SWITCHABLE = new Set(['backend_missing', 'unsupported', 'not_found'])
+
+/** Map lux stderr onto the same error codes yt-dlp uses. */
+export function classifyLuxError(text) {
+  const s = String(text || '')
+  if (/exec: "?ffmpeg"?|ffmpeg (?:not found|is not installed)|找不到 ffmpeg/i.test(s)) return 'missing_ffmpeg'
+  if (/unsupported URL|not supported|no (?:matching )?extractor|unsupported site/i.test(s)) return 'unsupported'
+  if (/no (?:available )?streams|no video (?:found|stream)|extract(?:ion)? failed|get video info failed|cannot unmarshal/i.test(s)) return 'not_found'
+  if (/need(?:s)? (?:to )?log ?in|sign in|login required|cookie|会员|付费|VIP|试看/i.test(s)) return 'need_login'
+  if (/40[13]|429|Forbidden|Unauthorized|risk|verify|blocked/i.test(s)) return 'blocked'
+  if (/timeout|deadline exceeded|dial tcp|no such host|connection reset|TLS handshake|EOF|network is unreachable/i.test(s)) return 'network'
+  if (/404|not found/i.test(s)) return 'not_found'
+  return 'download_failed'
+}
+
+/** Keep only the meaningful tail of lux output. */
+function luxMessage(output, code) {
+  const lines = String(output || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  return lines.slice(-3).join(' ') || `lux 退出码 ${code}`
+}
+
+/**
+ * `lux -i -j` 的 stdout → 条目数组。
+ * lux 打的是数组（一个 URL 可能展开成多个条目，例如播放列表），但也可能夹带进度行，
+ * 所以按第一个 `[` 到最后一个 `]` 截取，解析失败就当没解析出来。
+ */
+export function luxParseJson(stdout) {
+  const s = String(stdout || '').trim()
+  if (!s) return []
+  const a = s.indexOf('[')
+  const b = s.lastIndexOf(']')
+  const candidates = []
+  if (a >= 0 && b > a) candidates.push(s.slice(a, b + 1))
+  candidates.push(s)
+  for (const c of candidates) {
+    try {
+      const v = JSON.parse(c)
+      const arr = Array.isArray(v) ? v : [v]
+      return arr.filter((x) => x && typeof x === 'object' && !Array.isArray(x))
+    } catch {
+      // try the next shape
+    }
+  }
+  return []
+}
+
+/** lux 的 quality 是自由文本（"清晰 480P avc1.64001E"），这里只抓分辨率。 */
+export function luxHeight(stream) {
+  const q = String((stream && stream.quality) || '')
+  const m = q.match(/(\d{3,4})\s*[Pp]/)
+  return m ? Number(m[1]) : null
+}
+
+/** 一个 lux 条目的 streams → 统一的清晰度列表（按分辨率、体积降序）。 */
+export function luxQualities(entry) {
+  const streams = entry && entry.streams && typeof entry.streams === 'object' ? entry.streams : {}
+  const list = []
+  for (const [key, s] of Object.entries(streams)) {
+    if (!s || typeof s !== 'object') continue
+    const parts = Array.isArray(s.parts) ? s.parts : []
+    list.push({
+      formatId: String(s.id || key),
+      quality: String(s.quality || ''),
+      ext: String(s.ext || (parts[0] && parts[0].ext) || ''),
+      height: luxHeight(s),
+      filesize: Number(s.size) > 0 ? Number(s.size) : null,
+      parts: parts.length,
+      needMux: s.NeedMux === true,
+    })
+  }
+  return list.sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.filesize ?? 0) - (a.filesize ?? 0))
+}
+
+/** 清晰度偏好 → 目标高度。best=Infinity、worst=0，B站 的数字档位按已知高度换算。 */
+export function luxTargetHeight(quality) {
+  const q = String(quality == null ? 'best' : quality).trim().toLowerCase()
+  if (!q || q === 'best') return Infinity
+  if (q === 'worst') return 0
+  const known = { 112: 1080, 80: 1080, 74: 720, 64: 720, 32: 480, 16: 360 }
+  if (known[q]) return known[q]
+  const m = q.match(/^(\d{3,4})p?$/)
+  return m ? Number(m[1]) : Infinity
+}
+
+/** 在 luxQualities 结果里挑一条流：够不着的档位自动降到最接近且可达的那一档。 */
+export function pickLuxStream(list, quality) {
+  const arr = Array.isArray(list) ? list.filter((x) => x && x.formatId) : []
+  if (!arr.length) return null
+  const withH = arr.filter((x) => x.height != null)
+  const target = luxTargetHeight(quality)
+  if (target === 0) {
+    const pool = withH.length ? withH : arr
+    return pool.slice().sort((a, b) => (a.height ?? 1e9) - (b.height ?? 1e9) || (a.filesize ?? 0) - (b.filesize ?? 0))[0]
+  }
+  if (target === Infinity || !withH.length) return arr[0]
+  const ok = withH.filter((x) => x.height <= target)
+  return ok.length ? ok[0] : withH[withH.length - 1]
+}
+
+/** 下载参数（纯函数，单测就钉这里）。`-O` 是基名，扩展名由 lux 自己按流决定。 */
+export function luxArgs(input, { cookies, outDir, name, format, threads } = {}) {
+  const args = ['-s']
+  if (format) args.push('-f', String(format))
+  if (outDir) args.push('-o', String(outDir))
+  if (name) args.push('-O', String(name))
+  if (cookies) args.push('-c', String(cookies))
+  if (threads) args.push('-n', String(threads))
+  args.push(String(input))
+  return args
+}
+
+/**
+ * lux 不打印落盘路径（`-s` 时更没有），所以下载后按基名在目录里找。
+ * 只认「本次开始之后写过的、非空、非临时」的文件，避免把上一次同名的旧文件当成结果。
+ */
+export function pickLuxOutput(dir, base, { since = 0 } = {}) {
+  if (!dir || !base) return ''
+  let names = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return ''
+  }
+  const esc = String(base).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // `-O name` 出来的就是 name + '.' + ext：先按这条精确匹配，避免把同前缀的另一条视频当成本次结果。
+  const exact = new RegExp('^' + esc + '\\.[A-Za-z0-9]{1,5}$')
+  const stem = String(base).slice(0, 24)
+  const collect = (pred) => {
+    const hits = []
+    for (const n of names) {
+      if (!pred(n)) continue
+      if (/\.(?:part|tmp|temp|ytdl|m4s)$/i.test(n)) continue
+      const p = join(dir, n)
+      let st = null
+      try {
+        st = statSync(p)
+      } catch {
+        continue
+      }
+      if (!st.isFile() || st.size <= 0) continue
+      if (since && st.mtimeMs < since - 2000) continue
+      hits.push({ p, size: st.size, mtime: st.mtimeMs })
+    }
+    return hits
+  }
+  let hits = collect((n) => exact.test(n))
+  if (!hits.length && stem) hits = collect((n) => n.startsWith(stem))
+  if (!hits.length) return ''
+  hits.sort((a, b) => b.mtime - a.mtime || b.size - a.size)
+  return hits[0].p
+}
+
+/**
+ * 大小写不敏感地设环境变量。
+ * Windows 上 process.env 的键是 `Path`，直接写 `env.PATH` 会留成两份同名不同大小写的键，
+ * 子进程取到哪一份不确定 —— 之前 lux 就是因此拿到只剩一个点的 PATH，ffmpeg 直接找不到。
+ */
+export function setEnvInsensitive(env, name, value) {
+  const upper = name.toUpperCase()
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === upper) delete env[key]
+  }
+  env[name] = value
+}
+
+function runLux(bin, args, { signal } = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const env = { ...process.env }
+    // lux 合并分离的音视频轨时直接 exec ffmpeg，只认 PATH：把已知 ffmpeg 的目录塞到最前。
+    // 只有拿到绝对路径才值得前置（相对名 'ffmpeg' 说明它本来就在 PATH 里）。
+    const ffmpeg = findFfmpeg()
+    if (ffmpeg && isAbsolute(ffmpeg)) {
+      const dir = dirname(ffmpeg)
+      const sep = process.platform === 'win32' ? ';' : ':'
+      const current = Object.entries(env).find(([k]) => k.toUpperCase() === 'PATH')?.[1] || ''
+      setEnvInsensitive(env, 'PATH', dir + sep + current)
+    }
+    // lux 只认 HTTP_PROXY / HTTPS_PROXY 环境变量，没有 --proxy 参数。
+    const proxy = (process.env.DSH_LUX_PROXY || '').trim() || panelStr('ytdlpProxy') || (process.env.DSH_YTDLP_PROXY || '').trim()
+    if (proxy) {
+      setEnvInsensitive(env, 'HTTP_PROXY', proxy)
+      setEnvInsensitive(env, 'HTTPS_PROXY', proxy)
+    }
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true, env })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (c) => {
+      stdout += c.toString()
+      if (stdout.length > 400_000) stdout = stdout.slice(-400_000)
+    })
+    child.stderr.on('data', (c) => {
+      stderr += c.toString()
+      if (stderr.length > 20_000) stderr = stderr.slice(-20_000)
+    })
+    child.on('error', (err) => rejectPromise(new Error(`无法启动 lux：${err.message}`)))
+    child.on('close', (code) => resolvePromise({ code, stdout, stderr }))
+  })
+}
+
+function luxMissing() {
+  const err = new Error('本机没有找到 lux，无法用 lux 处理这个站点。安装后重试，或用 DSH_LUX_PATH / 设置页的 lux 路径指向 lux.exe。')
+  err.code = 'backend_missing'
+  return err
+}
+
+/** `lux -i -j` → 统一解析结构（qualities 里的 formatId 只对 lux 有效）。 */
+export async function resolveWithLux(input, { cookies, signal } = {}) {
+  const bin = findLux()
+  if (!bin) throw luxMissing()
+  const args = ['-i', '-j']
+  if (cookies) args.push('-c', String(cookies))
+  args.push(String(input))
+  const { code, stdout, stderr } = await runLux(bin, args, { signal })
+  const entries = luxParseJson(stdout)
+  if (code !== 0 || !entries.length) {
+    const err = new Error(luxMessage(stderr || stdout, code))
+    err.code = code !== 0 ? classifyLuxError(stderr || stdout) : 'not_found'
+    throw err
+  }
+  const entry = entries[0]
+  return {
+    backend: 'lux',
+    site: String(entry.site || 'unknown'),
+    title: String(entry.title || ''),
+    uploader: '',
+    durationSec: 0,
+    webpageUrl: String(entry.url || input),
+    thumbnail: '',
+    entries: entries.length,
+    qualities: luxQualities(entry),
+    audioOnly: false,
+    note: '这是 lux 的解析结果；formatId 是 lux 自己的流 id（如 32-12），只对 lux 有效。下载请用 video_download 给同一个链接。',
+  }
+}
+
+/** 用 lux 下载（先解析拿标题与流 id，再按基名落盘）。 */
+export async function downloadWithLux(input, { outPath, cookies, quality = 'best', signal } = {}) {
+  const bin = findLux()
+  if (!bin) throw luxMissing()
+  const started = Date.now()
+  const info = await resolveWithLux(input, { cookies, signal })
+  const stream = pickLuxStream(info.qualities, quality)
+  if (!stream) {
+    const err = new Error('lux 解析到了条目，但里面没有可下载的流')
+    err.code = 'not_found'
+    throw err
+  }
+  const outDir = outDirOf(outPath)
+  const dir = outDir || (outPath && isAbsolute(outPath) ? dirname(outPath) : defaultDownloadDir())
+  mkdirSync(dir, { recursive: true })
+  const baseFromName = outPath && isAbsolute(outPath) && !outDir ? basename(outPath).replace(/\.[a-z0-9]{1,5}$/i, '') : ''
+  const base = String((baseFromName || sanitizeName(info.title || 'video') || 'video')).slice(0, 80)
+
+  const args = luxArgs(input, { cookies, outDir: dir, name: base, format: stream.formatId })
+  const { code, stdout, stderr } = await runLux(bin, args, { signal })
+  const savedTo = pickLuxOutput(dir, base, { since: started })
+  if (code !== 0 || !savedTo) {
+    const err = new Error(code === 0 ? 'lux 退出码 0，但没在下载目录里找到落盘文件' : luxMessage(stderr || stdout, code))
+    err.code = code === 0 ? 'download_failed' : classifyLuxError(stderr || stdout)
+    throw err
+  }
+  let bytes = 0
+  try {
+    bytes = statSync(savedTo).size
+  } catch {
+    // size is informative only
+  }
+  return {
+    backend: 'lux',
+    savedTo,
+    bytes,
+    quality: stream.quality || String(quality || 'best'),
+    formatId: stream.formatId,
+    title: info.title,
+    elapsedMs: Date.now() - started,
+  }
+}
+
+/**
+ * 通用后端调度：按候选序列依次尝试，只在「这个后端干不了」时换下一个。
+ * kind = 'resolve' | 'download'；返回里带 attempts 时说明换过后端。
+ */
+export async function withGenericBackend(kind, input, opts = {}) {
+  const pref = panelStr('genericBackend') || (process.env.DSH_GENERIC_BACKEND || '').trim() || 'auto'
+  const order = genericBackendOrder(pref, { douyin: isDouyinSource(input) })
+  const attempts = []
+  let last = null
+  for (const backend of order) {
+    try {
+      const info =
+        kind === 'resolve'
+          ? backend === 'lux'
+            ? await resolveWithLux(input, opts)
+            : await resolveWithYtDlp(input, opts)
+          : backend === 'lux'
+            ? await downloadWithLux(input, opts)
+            : await downloadWithYtDlp(input, opts)
+      return attempts.length ? { ...info, attempts } : info
+    } catch (err) {
+      const code = err?.code || 'download_failed'
+      attempts.push({ backend, error: code, message: err?.message || String(err) })
+      last = err
+      if (!BACKEND_SWITCHABLE.has(code)) throw err
+    }
+  }
+  const err = new Error(last?.message || '本机没有可用的通用后端（yt-dlp / lux 都没找到）')
+  err.code = last?.code || 'backend_missing'
+  err.attempts = attempts
+  throw err
+}
+
 // ------------------------------------------------------- douyin browser backend
 // Douyin's detail API answers 403 unless a signed, cookie-bearing request comes
 // in, and the video page is a SPA whose HTML ships no media URL at all. The one
@@ -1896,9 +2286,7 @@ async function settingsSnapshot({ probe = false } = {}) {
   const sources = {}
   for (const key of Object.keys(CONFIG_KEYS)) {
     const entry = configEntry(key)
-    values[key] = entry.value !== undefined
-      ? entry.value
-      : key === 'defaultQuality' ? 'best' : key === 'biliUseCredential' ? true : ''
+    values[key] = entry.value !== undefined ? entry.value : CONFIG_DEFAULTS[key]
     sources[key] = entry.source
   }
   const found = biliCredentialPaths().find((file) => {
@@ -1907,6 +2295,9 @@ async function settingsSnapshot({ probe = false } = {}) {
   const status = {
     ffmpeg: findFfmpeg(),
     ytdlp: findYtDlp(),
+    lux: findLux(),
+    genericBackend: String(values.genericBackend || 'auto'),
+    genericOrder: genericBackendOrder(values.genericBackend),
     downloadDir: defaultDownloadDir(),
     credential: found,
     loggedIn: null,
@@ -1933,8 +2324,12 @@ function applySettingsPatch(patch) {
     }
     if (typeof value === 'string') {
       const text = value.trim()
-      if ((key === 'ffmpegPath' || key === 'ytdlpPath') && text && isAbsolute(text) && !existsSync(text)) {
-        warnings.push(`${key === 'ffmpegPath' ? 'ffmpeg' : 'yt-dlp'} 路径不存在，已退回自动探测`)
+      const binLabel = { ffmpegPath: 'ffmpeg', ytdlpPath: 'yt-dlp', luxPath: 'lux' }[key]
+      if (binLabel && text && isAbsolute(text) && !existsSync(text)) {
+        warnings.push(`${binLabel} 路径不存在，已退回自动探测`)
+      }
+      if (key === 'genericBackend' && text && !GENERIC_BACKEND_PREFS.includes(text)) {
+        throw new Error(`genericBackend 只能是 ${GENERIC_BACKEND_PREFS.join(' / ')}`)
       }
       if (key === 'downloadDir' && text) {
         try {
@@ -2094,16 +2489,23 @@ export function apply(ctx, config) {
     name: 'video_analyze',
     description:
       '快速判断一个链接：是不是媒体、属于哪个站点（bilibili/youtube/douyin/xiaohongshu/other）、' +
-      '会由哪个后端处理、可能清晰度、容器扩展名与 mime 提示。纯分析，不联网。返回 JSON ' +
-      '{ isMedia, site, quality, ext, mimeHint, backend, kind, hint }；backend=bilibili 走内置解析，' +
-      'backend=ytdlp 表示这是其他站点页面链接、交给本机通用后端，backend=direct 是媒体直链，' +
+      '会由哪个后端处理、可能清晰度、容器扩展名与 mime 提示。纯分析，不联网（本机后端探测会缓存）。返回 JSON ' +
+      '{ isMedia, site, quality, ext, mimeHint, backend, kind, hint, genericBackends }；backend=bilibili 走内置解析，' +
+      'backend=ytdlp 表示这是其他站点页面链接、交给本机通用后端（按 genericBackends 的顺序试），backend=direct 是媒体直链，' +
       'backend=unsupported 是本插件不处理的情况。kind=page 的链接可以直接交给 video_download。',
     parameters: {
       url: { type: 'string', required: true, description: '要分析的链接（页面链接或媒体直链）。' },
     },
     output: OUTPUT,
     async execute(args) {
-      return JSON.stringify(analyze(args.url))
+      const out = analyze(args.url)
+      const pref = panelStr('genericBackend') || (process.env.DSH_GENERIC_BACKEND || '').trim() || 'auto'
+      out.genericBackends = {
+        preference: pref,
+        order: genericBackendOrder(pref, { douyin: isDouyinSource(args.url) }),
+        available: { ytdlp: findYtDlp(), lux: findLux() },
+      }
+      return JSON.stringify(out)
     },
   }))
 
@@ -2112,10 +2514,12 @@ export function apply(ctx, config) {
     description:
       '把视频页面链接解析成真实媒体流，不下载。B站 视频页/BV 号/b23.tv 短链走内置解析；' +
       '抖音页面（含个人页 ?modal_id=、短链、分享文本）先用本地浏览器通路取播放源，再退回 yt-dlp；' +
-      '其他站点（小红书、YouTube、快手等）交给本机通用后端 yt-dlp 解析。' +
+      '其他站点（小红书、YouTube、快手、腾讯视频等）交给本机通用后端：yt-dlp 优先、lux 兜底' +
+      '（顺序由设置页「通用后端」决定，抖音永远不用 lux）。' +
       'B站 返回 { site, bvid, cid, page, title, durationSec, qualities[], video{...}, audio{...}, requiresMux, expiresAt }；' +
       '抖音返回 { backend:"douyin-browser", pageUrl, title, qualities[] }；' +
-      '通用后端返回 { backend:"ytdlp", site, title, uploader, durationSec, qualities[], audioOnly }。' +
+      '通用后端返回 { backend:"ytdlp"|"lux", site, title, uploader, durationSec, qualities[], audioOnly }，' +
+      '换过后端时另带 attempts[{}]。' +
       '成功返回解析结果；失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / backend_missing / no_stream。',
     parameters: {
       url: { type: 'string', required: true, description: '视频页面链接、BV 号或 b23.tv 短链。' },
@@ -2152,12 +2556,16 @@ export function apply(ctx, config) {
               // Douyin also has a yt-dlp extractor; try it before giving up.
             }
           }
-          const info = await resolveWithYtDlp(url, { cookies: args.cookies, signal: exec?.signal })
+          const info = await withGenericBackend('resolve', url, { cookies: args.cookies, signal: exec?.signal })
           return JSON.stringify(info, null, 2)
         }
         return JSON.stringify({ error: 'unsupported', message: analyze(url).hint })
       } catch (err) {
-        return JSON.stringify({ error: err?.code || 'resolve_failed', message: err?.message || String(err) })
+        return JSON.stringify({
+          error: err?.code || 'resolve_failed',
+          message: err?.message || String(err),
+          ...(err?.attempts ? { attempts: err.attempts } : {}),
+        })
       }
     },
   }))
@@ -2167,10 +2575,12 @@ export function apply(ctx, config) {
     description:
       '把视频下载到本机，接受三类输入：①媒体直链（mp4/m3u8/mpd/flv/m4s/音频）直接下；' +
       '②B站 视频页面链接 / BV 号 / b23.tv 短链，内置解析 + ffmpeg 合并；' +
-      '③其他站点页面链接（抖音、小红书、YouTube、快手等），交给本机通用后端 yt-dlp 下载。' +
+      '③其他站点页面链接（抖音、小红书、YouTube、快手、腾讯视频等），交给本机通用后端：' +
+      'yt-dlp 优先、lux 兜底（顺序由设置页「通用后端」决定；抖音永远不用 lux）。' +
       '抖音（含个人页 ?modal_id=、短链、分享文本）先用无头浏览器取播放源、不吃 Cookie；' +
       'm3u8/mpd 播放列表交给合并后端抓分片，不会把播放列表文本当成视频存下来。' +
-      '返回 JSON { savedTo, bytes, quality, backend, title?, elapsedMs }；savedTo 是真实绝对路径。' +
+      '返回 JSON { savedTo, bytes, quality, backend, title?, elapsedMs }；savedTo 是真实绝对路径，' +
+      'backend 可能是 bilibili / ytdlp / lux / douyin-browser / direct，换过后端时另带 attempts[{}]。' +
       '失败返回 { error, message }，error 取值 unsupported / need_login / blocked / network / missing_ffmpeg / backend_missing / no_stream / download_failed。' +
       '默认目录：$DSH_VIDEO_DOWNLOAD_DIR，未设置时为用户 Downloads/dsh-video-downloader。',
     parameters: {
@@ -2219,7 +2629,7 @@ export function apply(ctx, config) {
               }
             }
           }
-          const info = await downloadWithYtDlp(url, {
+          const info = await withGenericBackend('download', url, {
             outPath: args.outPath,
             cookies: args.cookies,
             quality: args.quality || panelStr('defaultQuality') || 'best',
@@ -2247,6 +2657,7 @@ export function apply(ctx, config) {
         return JSON.stringify({
           error: err?.code || 'download_failed',
           message: err?.message || String(err),
+          ...(err?.attempts ? { attempts: err.attempts } : {}),
           elapsedMs: Date.now() - started,
         })
       } finally {

@@ -2,15 +2,15 @@
 
 DeepSeek Harness（DSH）0.2.x 的视频下载插件：丢一个视频页面链接就能下载，不需要先拿到直链。
 
-面向 **DSH 0.2.1-rc.2** 重写，三条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端 yt-dlp。
+面向 **DSH 0.2.1-rc.2** 重写，三条链路：B 站走内置解析（不依赖外部程序），抖音走本机无头浏览器取播放流（不需要 Cookie），其他站点交给本机通用后端（yt-dlp 优先、lux 兜底）。
 
 ## 功能
 
 | 工具 | 作用 |
 | --- | --- |
-| `video_analyze` | 判断链接类型与由哪个后端处理：`bilibili` / `ytdlp` / `direct` / `unsupported`，给出站点、扩展名、MIME 提示。纯本地计算 |
-| `video_resolve` | 把页面链接解析成流清单，不下载：B 站走内置解析，抖音走本地浏览器通路，其他站点走 yt-dlp |
-| `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；抖音用本地浏览器取播放流直下；其他站点页面链接交给 yt-dlp |
+| `video_analyze` | 判断链接类型与由哪个后端处理：`bilibili` / `ytdlp`（通用后端）/ `direct` / `unsupported`，给出站点、扩展名、MIME 提示，以及通用后端当前的候选顺序与就绪情况。纯本地计算 |
+| `video_resolve` | 把页面链接解析成流清单，不下载：B 站走内置解析，抖音走本地浏览器通路，其他站点走通用后端（yt-dlp → lux） |
+| `video_download` | 下载：直链直接下；B 站页面链接内置解析 + ffmpeg 合并；抖音用本地浏览器取播放流直下；其他站点页面链接交给通用后端（yt-dlp → lux） |
 | `video_quality_parse` | 从 URL 参数推断画质与容器格式，纯本地计算 |
 
 ## 使用示例
@@ -24,9 +24,11 @@ video_download  { "url": "https://www.xiaohongshu.com/explore/xxxx", "cookies": 
 video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\clip.mp4" }
 ```
 
-`video_download` 返回 JSON：`savedTo`（落盘路径）、`bytes`、`backend`（`bilibili` / `ytdlp` / `direct`）、`quality`、`title`、`elapsedMs`；失败返回 `{ "error": "...", "message": "..." }`，不会把异常抛到会话里。
+`video_download` 返回 JSON：`savedTo`（落盘路径）、`bytes`、`backend`（`bilibili` / `ytdlp` / `lux` / `douyin-browser` / `direct`）、`quality`、`title`、`elapsedMs`；失败返回 `{ "error": "...", "message": "..." }`，不会把异常抛到会话里。
 
-`error` 取值：`unsupported`（插件不处理这类链接）、`need_login`（要登录态，给 `cookies` 再试）、`blocked`（风控/403/429，含抖音的 Argus 拦截）、`unavailable`（视频已删除或地区限制）、`not_found`（404）、`network`、`missing_ffmpeg`、`backend_missing`（没装 yt-dlp 或找不到浏览器）、`no_stream`（播放页没给出可下载地址）。
+换过通用后端时（例如 yt-dlp 说 `unsupported` 之后 lux 接手），返回里另带 `attempts: [{ backend, error, message }]`，能看出是谁失败、为什么换。
+
+`error` 取值：`unsupported`（插件不处理这类链接）、`need_login`（要登录态，给 `cookies` 再试）、`blocked`（风控/403/429，含抖音的 Argus 拦截）、`unavailable`（视频已删除或地区限制）、`not_found`（404）、`network`、`missing_ffmpeg`、`backend_missing`（没装 yt-dlp / lux，或找不到浏览器）、`no_stream`（播放页没给出可下载地址）。
 
 ## 下载位置
 
@@ -44,7 +46,7 @@ video_download  { "url": "https://example.com/clip.mp4", "outPath": "D:\\media\\
 
 ### yt-dlp
 
-B 站以外站点靠它解析与下载，站点适配、签名、登录态都由它维护，插件只负责调用与归因。
+通用后端的**主力**：B 站以外站点优先靠它解析与下载，站点适配、签名、登录态都由它维护，插件只负责调用与归因。
 
 1. 环境变量 `DSH_YTDLP_PATH`
 2. `PATH` 上的 `yt-dlp` / `yt-dlp.exe`
@@ -54,6 +56,32 @@ B 站以外站点靠它解析与下载，站点适配、签名、登录态都由
 需要代理才能访问的站点（如 YouTube），设置 `DSH_YTDLP_PROXY=http://127.0.0.1:7897`。
 
 需要登录态的内容，把浏览器导出的 `cookies.txt` 路径传给 `cookies` 参数；插件不接触账号密码。
+
+### lux
+
+第二通用后端，**只兜底**：补 yt-dlp 没有的那几个国内站（快手、腾讯视频、好看视频、秒拍、Threads、StreamTape…）。它的站点表停在 2024 年，官方接口一改就会失效，所以默认顺序是 yt-dlp 先、lux 后。
+
+安装（需要 Go）：
+
+```bash
+GOPROXY=https://goproxy.cn,direct go install github.com/iawia002/lux@latest
+```
+
+查找顺序：
+
+1. 设置页「lux 路径」或环境变量 `DSH_LUX_PATH`
+2. `PATH` 上的 `lux` / `lux.exe`
+3. `GOBIN`、`~/go/bin`（`go install` 的默认落点）
+
+`lux -v` 会打印 `version v0.0.0` —— 这是 `go install` 没注入版本变量导致的，功能不受影响。
+
+几条已知差异：
+
+- **代理只认环境变量**：lux 没有 `--proxy` 参数，插件把「yt-dlp 代理」或 `DSH_LUX_PROXY` 写进子进程的 `HTTP_PROXY` / `HTTPS_PROXY`。
+- **`-f` 是站内自定义流 id**（如 `32-12`），和 yt-dlp 的 `formatId` 不能互用，靠返回里的 `backend` 区分。
+- **抖音永远不用 lux**：lux 关不掉代理，而抖音直链走系统代理会被风控；抖音只有浏览器通路与 yt-dlp 两条路。
+- 清晰度偏好按分辨率换算：`112`/`80`→1080P、`64`→720P、`32`→480P、`16`→360P；站点没这一档就降到最接近且可达的那一档。
+- lux 合并分离的音视频轨时直接 `exec ffmpeg`，只认 `PATH`，所以插件会把探测到的 ffmpeg 目录写进子进程 `PATH`（找不到 ffmpeg 时 lux 自己会以 `missing_ffmpeg` 报错）。
 
 ### ffmpeg
 
@@ -92,7 +120,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 
 **设置 → 左侧栏「视频下载」**（与「刷B站」同级的那一页）。改完点保存即生效，不用重启；留空 = 没设（退回下一层），所以清空设置页不会让插件失效。
 
-页面顶部是只读状态：B站 是否读到登录凭证、ffmpeg / yt-dlp 是否就绪、当前实际落盘目录、找到的凭证文件路径。
+页面顶部是只读状态：B站 是否读到登录凭证、ffmpeg / yt-dlp / lux 是否就绪、当前实际落盘目录、找到的凭证文件路径。
 
 | 设置项 | 默认 | 说明 |
 | --- | --- | --- |
@@ -102,9 +130,11 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 | B 站凭证文件路径 | 空 | 空 = 按 `DSH_BILI_CREDENTIAL` → `%APPDATA%\dsh-desktop\harness\bili-duty` → `$DSH_HOME` / `~/.dsh` 顺序自动查找 |
 | ffmpeg 路径 | 空 | 空 = 自动探测；填错会退回自动探测（页面会红字提示），不会让下载直接失败 |
 | yt-dlp 路径 | 空 | 同上 |
-| yt-dlp 代理 | 空 | 只作用于非 B 站站点；B 站 一律直连（抖音也强制直连） |
+| lux 路径 | 空 | 空 = 自动探测（`DSH_LUX_PATH` → `PATH` → `GOBIN` → `~/go/bin`）；只在 yt-dlp 干不了时被调用 |
+| 通用后端顺序 | `auto` | `auto` = yt-dlp 优先、lux 兜底（推荐）/ `ytdlp` = 只用 yt-dlp / `lux` = lux 优先、yt-dlp 兜底。抖音固定不用 lux |
+| yt-dlp 代理 | 空 | 只作用于非 B 站站点（yt-dlp 与 lux 共用）；B 站 一律直连（抖音也强制直连） |
 
-优先级：**单次工具调用的显式传参 > 设置页 > 环境变量 > 内置默认**。环境变量（`DSH_VIDEO_DOWNLOAD_DIR` / `DSH_BILI_CREDENTIAL` / `DSH_FFMPEG_PATH` / `DSH_YTDLP_PATH` / `DSH_YTDLP_PROXY`）仍可用，但设置页里填了就以设置页为准。
+优先级：**单次工具调用的显式传参 > 设置页 > 环境变量 > 内置默认**。环境变量（`DSH_VIDEO_DOWNLOAD_DIR` / `DSH_BILI_CREDENTIAL` / `DSH_FFMPEG_PATH` / `DSH_YTDLP_PATH` / `DSH_YTDLP_PROXY` / `DSH_LUX_PATH` / `DSH_LUX_PROXY` / `DSH_GENERIC_BACKEND`）仍可用，但设置页里填了就以设置页为准。
 
 这一页的存盘位置是 `$DSH_HOME/video-downloader/config.json`（只存你改过的键，删掉某个键就等于回到「没设」）。DSH 自带的「内置插件」里那份同一组字段的表单仍保留，两个入口写的是同一套值，谁后设谁生效。
 
@@ -115,7 +145,7 @@ B 站 DASH 流的视频与音频是分离的，需要 ffmpeg 合并。查找顺�
 - **B 站**：BV 号、标准页面链接、`b23.tv` 短链、多 P（`?p=`）。走内置解析；能读到 B 站登录凭证时清晰度上限等于账号权限（大会员可到 1080P+ / 4K / 8K），读不到就退回匿名（最高 480P）。凭证文件按 `DSH_BILI_CREDENTIAL` → `%APPDATA%\dsh-desktop\harness\bili-duty\bili_credential.json` → `$DSH_HOME` / `~/.dsh` 下的 `bili_credential.json` 顺序找，支持 `sessdata` / `bili_jct` / `buvid3` / `dedeuserid` 字段（值可以是 URL 编码）；凭证过期或文件损坏自动退回匿名，不会把请求弄挂。
 - **抖音**：`/video/<id>`、个人页 `?modal_id=<id>`、`v.douyin.com/<码>` 短链、整段分享文本（含短链）、裸的 19 位 id 都认；走本地浏览器通路，默认不需要 Cookie、不需要登录，公开作品即可下。直播、会员、私密作品不处理。
 - **直链媒体**：mp4 / m4s / webm / mkv / flv / ts 按扩展名与 Content-Type 判定，原生下载；m3u8 / mpd 是播放列表不是媒体本身，交给 yt-dlp 拉流合并，不再当成视频文件直接存盘。
-- **其他站点**：交给 yt-dlp，覆盖其支持的全部站点（小红书、YouTube、快手、Vimeo 等）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
+- **其他站点**：交给通用后端——yt-dlp 优先、lux 兜底，覆盖两者支持的站点（小红书、YouTube、Vimeo、快手、腾讯视频、好看视频等）。lux 的增量价值就是那几个 yt-dlp 没有的国内站；两边都有时仍由 yt-dlp 出手（适配与维护更好）。能不能下取决于站点与登录态：小红书多需 cookies，YouTube 需代理，会员内容仍受账号权限限制。
 - **不做**：DRM 内容、付费墙绕过。
 
 ## 安装
@@ -154,10 +184,10 @@ pnpm add github:fromzero1501/dsh-video-downloader-v2
 ## 测试
 
 ```bash
-node --test test/index.test.js
+node --test
 ```
 
-覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp 错误归因、抖音链接归一与播放列表分流、四个工具的注册与错误分支。
+覆盖链接分类与后端路由、BV/cid 提取、轨道挑选、文件名清洗、yt-dlp / lux 错误归因、抖音链接归一与播放列表分流、通用后端候选序列（含抖音排除 lux）、lux JSON 容错与流挑选、lux 落盘文件定位、子进程环境变量大小写、四个工具的注册与错误分支。
 
 ## 许可证
 

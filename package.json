@@ -1,7 +1,7 @@
 {
   "name": "dsh-video-downloader",
-  "version": "0.6.1",
-  "description": "DSH video downloader: Bilibili built-in, Douyin via local headless browser (warm, no cookie), yt-dlp for other sites",
+  "version": "0.7.0",
+  "description": "DSH video downloader: Bilibili built-in, Douyin via local headless browser (warm, no cookie), generic backend with yt-dlp first and lux as fallback",
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -26,7 +26,10 @@
     "bilibili",
     "youtube",
     "douyin",
-    "xiaohongshu"
+    "xiaohongshu",
+    "yt-dlp",
+    "lux",
+    "kuaishou"
   ],
   "license": "MIT",
   "repository": {
@@ -50,7 +53,7 @@
     }
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dsh": {
     "manifestVersion": 1,

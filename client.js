@@ -7,7 +7,7 @@
  * 不要自己糊标题栏按钮 + 全屏遮罩（第一版那样做，一眼就跟别的插件不一样）。
  *
  * 这一页只做两件事：
- *   ① 读 `/api/video-downloader/state` —— 7 项当前生效值 + 只读状态（登录态 / ffmpeg / yt-dlp / 落地目录）
+ *   ① 读 `/api/video-downloader/state` —— 9 项当前生效值 + 只读状态（登录态 / ffmpeg / yt-dlp / lux / 落地目录）
  *   ② 写 `/api/video-downloader/config` —— 保存改动，写完回读核对；失败必须红字，不许绿字骗人
  */
 window.__ModuleLoader__.load({
@@ -45,6 +45,13 @@ window.__ModuleLoader__.load({
       ['64', '64 —— 720P'],
       ['32', '32 —— 480P'],
       ['16', '16 —— 360P'],
+    ]
+
+    // 非 B站 站点的后端顺序：auto 是推荐值（lux 站点维护停滞，不该挡在前面）
+    const BACKEND_OPTIONS = [
+      ['auto', 'auto —— yt-dlp 优先，lux 兜底（推荐）'],
+      ['ytdlp', 'yt-dlp —— 只用 yt-dlp'],
+      ['lux', 'lux —— lux 优先，yt-dlp 兜底'],
     ]
 
     const CSS = `
@@ -165,6 +172,8 @@ window.__ModuleLoader__.load({
             st.ffmpeg ? 'ffmpeg 就绪' : 'ffmpeg 未找到'),
           h('span', { 'data-vd-badge': '', 'data-on': st.ytdlp ? '' : undefined },
             st.ytdlp ? 'yt-dlp 就绪' : 'yt-dlp 未找到'),
+          h('span', { 'data-vd-badge': '', 'data-on': st.lux ? '' : undefined },
+            st.lux ? 'lux 就绪' : 'lux 未找到'),
           h('div', { 'data-vd-grow': '' }),
           h('button', { 'data-vd-btn': '', 'data-primary': '', disabled: busy, onClick: save },
             busy ? '保存中…' : '保存'),
@@ -217,6 +226,23 @@ window.__ModuleLoader__.load({
             : '没找到凭证文件（此时自动退回匿名 480P）')),
 
         h('div', { 'data-vd-sec': '' },
+          h('div', { 'data-vd-h': '' }, '通用后端（非 B站 站点）'),
+          h('div', { 'data-vd-row': '' },
+            h('div', { 'data-vd-grow': '' },
+              h('div', { 'data-vd-label': '' }, '后端顺序'),
+              h('div', { 'data-vd-note': '' }, 'lux 只补 yt-dlp 没有的国内站（快手、腾讯视频、好看视频…），站点接口一改就失效，所以默认让它兜底；抖音固定走浏览器通路，不会用 lux'),
+              h('div', { 'data-vd-src': '' }, srcText('genericBackend'))),
+            h('div', { style: { width: '52%', maxWidth: '520px' } },
+              h('select', {
+                'data-vd-input': '',
+                value: form.genericBackend || 'auto',
+                onChange: (e) => setKey('genericBackend', e.target.value),
+              }, BACKEND_OPTIONS.map(([v, label]) => h('option', { key: v, value: v }, label))))),
+          h('div', { 'data-vd-note': '' },
+            '现在实际顺序：' + ((st.genericOrder && st.genericOrder.length) ? st.genericOrder.join(' → ') : '—')
+            + '（只有「这个后端干不了」才会换下一个；要登录或被风控时直接报错，不换）')),
+
+        h('div', { 'data-vd-sec': '' },
           h('div', { 'data-vd-h': '' }, '外部组件'),
           h(Field, {
             label: 'ffmpeg 路径',
@@ -235,8 +261,16 @@ window.__ModuleLoader__.load({
             onChange: (v) => setKey('ytdlpPath', v),
           }),
           h(Field, {
+            label: 'lux 路径',
+            note: '留空 = 自动探测（DSH_LUX_PATH → PATH → GOBIN → ~/go/bin）；只在 yt-dlp 干不了时被调用',
+            placeholder: st.lux || '自动探测',
+            value: form.luxPath,
+            source: srcText('luxPath'),
+            onChange: (v) => setKey('luxPath', v),
+          }),
+          h(Field, {
             label: 'yt-dlp 代理',
-            note: '只作用于非 B站 站点；B站 与抖音强制直连。例：http://127.0.0.1:7890',
+            note: '只作用于非 B站 站点（yt-dlp 与 lux 共用）；B站 与抖音强制直连。例：http://127.0.0.1:7890',
             placeholder: '留空 = 不用代理',
             value: form.ytdlpProxy,
             source: srcText('ytdlpProxy'),

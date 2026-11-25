@@ -1,29 +1,38 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
   apply,
   analyze,
+  classifyLuxError,
   classifyYtDlpError,
   detectSite,
   douyinVideoId,
   extractBvid,
   extractPage,
+  genericBackendOrder,
   getExt,
   getQuality,
   isMedia,
   isPlaylistUrl,
   isResolvablePage,
   douyinShortLink,
+  luxArgs,
+  luxParseJson,
+  luxQualities,
+  luxTargetHeight,
   normalizeDouyinUrl,
+  pickLuxOutput,
+  pickLuxStream,
   resolveDouyinInput,
   outDirOf,
   pickAudioTrack,
   pickVideoTrack,
   routeFor,
   sanitizeName,
+  setEnvInsensitive,
 } from '../src/index.js'
 
 // Minimal ctx: enough for `apply` to register tools and for the pure tools to run.
@@ -275,4 +284,125 @@ test('resolveDouyinInput answers a canonical page for a bare id and passes other
   assert.equal(byId.pageUrl, 'https://www.douyin.com/video/7700634421217620730')
   assert.equal(byId.via, 'id')
   assert.equal(await resolveDouyinInput('https://example.com/clip.mp4'), null)
+})
+
+// ------------------------------------------------------------------ lux backend
+
+test('genericBackendOrder: auto puts yt-dlp first, lux pref flips it, Douyin never gets lux', () => {
+  assert.deepEqual(genericBackendOrder('auto'), ['ytdlp', 'lux'])
+  assert.deepEqual(genericBackendOrder('lux'), ['lux', 'ytdlp'])
+  assert.deepEqual(genericBackendOrder('ytdlp'), ['ytdlp'])
+  assert.deepEqual(genericBackendOrder(undefined), ['ytdlp', 'lux'])
+  assert.deepEqual(genericBackendOrder('nonsense'), ['ytdlp', 'lux'])
+  assert.deepEqual(genericBackendOrder('lux', { douyin: true }), ['ytdlp'])
+})
+
+test('classifyLuxError maps lux output onto the shared error codes', () => {
+  assert.equal(classifyLuxError('exec: "ffmpeg": executable file not found in %PATH%'), 'missing_ffmpeg')
+  assert.equal(classifyLuxError('unsupported URL: https://example.com/x'), 'unsupported')
+  assert.equal(classifyLuxError('get video info failed: no available streams'), 'not_found')
+  assert.equal(classifyLuxError('this video need login'), 'need_login')
+  assert.equal(classifyLuxError('HTTP 403 Forbidden'), 'blocked')
+  assert.equal(classifyLuxError('dial tcp: lookup example.com: no such host'), 'network')
+  assert.equal(classifyLuxError('something else broke'), 'download_failed')
+})
+
+test('luxParseJson tolerates progress noise and rejects broken payloads', () => {
+  const one = luxParseJson('downloading...\n[{"title":"T","streams":{}}]\ndone')
+  assert.equal(one.length, 1)
+  assert.equal(one[0].title, 'T')
+  assert.deepEqual(luxParseJson('not json at all'), [])
+  assert.deepEqual(luxParseJson(''), [])
+  assert.equal(luxParseJson('{"title":"single"}').length, 1)
+})
+
+const LUX_ENTRY = {
+  title: 'demo',
+  streams: {
+    '16-7': { id: '16-7', quality: '流畅 360P avc1.64001E', size: 7672578, ext: 'mp4', parts: [{}, {}], NeedMux: true },
+    '32-12': { id: '32-12', quality: '清晰 480P hvc1.1.6.L120.90', size: 9000000, ext: 'mp4', parts: [{}], NeedMux: true },
+    '80-7': { id: '80-7', quality: '高清 1080P avc1', size: 40000000, ext: 'mp4', parts: [{}], NeedMux: true },
+    odd: { id: 'odd', quality: 'unknown', size: 1234, ext: 'flv', parts: [] },
+  },
+}
+
+test('luxQualities sorts by height then size and keeps lux stream ids', () => {
+  const list = luxQualities(LUX_ENTRY)
+  assert.deepEqual(list.map((x) => x.formatId), ['80-7', '32-12', '16-7', 'odd'])
+  assert.equal(list[0].height, 1080)
+  assert.equal(list[0].needMux, true)
+  assert.equal(list[3].height, null)
+  assert.equal(list[3].filesize, 1234)
+  assert.deepEqual(luxQualities({}), [])
+})
+
+test('luxTargetHeight maps best/worst/Bilibili numeric ids/raw heights', () => {
+  assert.equal(luxTargetHeight('best'), Infinity)
+  assert.equal(luxTargetHeight(''), Infinity)
+  assert.equal(luxTargetHeight('worst'), 0)
+  assert.equal(luxTargetHeight('64'), 720)
+  assert.equal(luxTargetHeight('480p'), 480)
+  assert.equal(luxTargetHeight('720'), 720)
+})
+
+test('pickLuxStream respects best/worst/ceiling and degrades to the closest reachable stream', () => {
+  const list = luxQualities(LUX_ENTRY)
+  assert.equal(pickLuxStream(list, 'best').formatId, '80-7')
+  assert.equal(pickLuxStream(list, 'worst').formatId, '16-7')
+  assert.equal(pickLuxStream(list, '64').formatId, '32-12')
+  assert.equal(pickLuxStream(list, '16').formatId, '16-7')
+  const no480 = list.filter((x) => x.formatId !== '32-12')
+  assert.equal(pickLuxStream(no480, '64').formatId, '16-7')
+  assert.equal(pickLuxStream([], 'best'), null)
+})
+
+test('luxArgs builds the download command with the URL last', () => {
+  assert.deepEqual(luxArgs('https://example.com/v/1', { format: '32-12', outDir: 'D:\\out', name: 'demo' }), [
+    '-s',
+    '-f',
+    '32-12',
+    '-o',
+    'D:\\out',
+    '-O',
+    'demo',
+    'https://example.com/v/1',
+  ])
+  assert.deepEqual(luxArgs('u', { cookies: '/tmp/c.txt' }), ['-s', '-c', '/tmp/c.txt', 'u'])
+  assert.deepEqual(luxArgs('u'), ['-s', 'u'])
+})
+
+test('setEnvInsensitive keeps a single PATH key (regression: lux lost ffmpeg)', () => {
+  const env = { Path: 'C:\\a;C:\\b', FOO: '1' }
+  setEnvInsensitive(env, 'PATH', 'D:\\ff;C:\\a;C:\\b')
+  assert.deepEqual(Object.keys(env).filter((k) => k.toUpperCase() === 'PATH'), ['PATH'])
+  assert.equal(env.PATH, 'D:\\ff;C:\\a;C:\\b')
+  assert.equal(env.FOO, '1')
+  // 大小写不同的旧键必须一并去掉，否则子进程可能取到旧值
+  setEnvInsensitive(env, 'http_proxy', 'http://127.0.0.1:7890')
+  assert.deepEqual(Object.keys(env).filter((k) => k.toLowerCase() === 'http_proxy'), ['http_proxy'])
+})
+
+test('pickLuxOutput only accepts files this run wrote, and prefers the exact base name', () => {  const dir = mkdtempSync(join(tmpdir(), 'dsh-lux-out-'))
+  try {
+    const stale = join(dir, 'demo.mp4')
+    writeFileSync(stale, 'old')
+    const past = (Date.now() - 3600_000) / 1000
+    utimesSync(stale, past, past)
+    // 目录里只有一小时前的同名文件：不算本次结果
+    assert.equal(pickLuxOutput(dir, 'demo', { since: Date.now() - 60_000 }), '')
+
+    const fresh = join(dir, 'demo.mp4')
+    writeFileSync(fresh, 'new-bytes')
+    assert.equal(pickLuxOutput(dir, 'demo', { since: Date.now() - 60_000 }), fresh)
+
+    // 同前缀的另一条视频 + 半成品都不能被当成结果
+    writeFileSync(join(dir, 'demo live.mp4'), 'other-video')
+    writeFileSync(join(dir, 'demo.webm.part'), 'partial')
+    assert.equal(pickLuxOutput(dir, 'demo', { since: Date.now() - 60_000 }), fresh)
+
+    // 没有 since 限制时也优先精确同名（体积/时间更大的那条优先）
+    assert.equal(pickLuxOutput(dir, 'demo'), fresh)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
